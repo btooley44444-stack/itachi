@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "python3", "gcc", "make"]
+
+[phases.build]
+cmds = [
+  "ln -sf $(which python3) /usr/local/bin/python || true",
+  "npm install"
+]
+
+[start]
+cmd = "node bot.js"
