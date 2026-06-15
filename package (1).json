@@ -1,0 +1,17 @@
+{
+  "name": "itachii-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.17.0",
+    "discord.js": "^14.14.1",
+    "ffmpeg-static": "^5.2.0",
+    "libsodium-wrappers": "^0.7.13",
+    "opusscript": "^0.0.8",
+    "play-dl": "^1.9.7",
+    "yt-dlp-exec": "^1.0.2"
+  }
+}
