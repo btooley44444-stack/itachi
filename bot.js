@@ -9,13 +9,13 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const play = require('play-dl');
-const ytdl = require('@distube/ytdl-core');
 const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
+const { exec } = require('child_process');
+const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 
-ffmpeg.setFfmpegPath(ffmpegPath);
+const execAsync = promisify(exec);
 
 const client = new Client({
   intents: [
@@ -29,6 +29,7 @@ const client = new Client({
 const PREFIX = '!';
 const guilds = new Map();
 
+// ── Guild state ───────────────────────────────────────────────────────────────
 function getGuild(guildId) {
   if (!guilds.has(guildId)) {
     const player = createAudioPlayer();
@@ -51,17 +52,62 @@ function getGuild(guildId) {
   return guilds.get(guildId);
 }
 
+// ── yt-dlp helpers ────────────────────────────────────────────────────────────
+async function getAudioResource(url) {
+  // Get the direct CDN audio URL from yt-dlp (no login needed)
+  const { stdout } = await execAsync(
+    `yt-dlp -f "bestaudio[ext=webm]/bestaudio/best" -g --no-playlist "${url}"`
+  );
+  const streamUrl = stdout.trim().split('\n')[0];
+
+  const ffmpegStream = ffmpeg(streamUrl)
+    .inputOptions(['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'])
+    .noVideo()
+    .audioCodec('libopus')
+    .audioFrequency(48000)
+    .audioChannels(2)
+    .format('ogg')
+    .on('error', (err) => console.error('FFmpeg error:', err.message))
+    .pipe();
+
+  return createAudioResource(ffmpegStream, { inputType: StreamType.OggOpus });
+}
+
+async function resolveTrack(query) {
+  // Direct YouTube URL
+  if (query.includes('youtube.com') || query.includes('youtu.be')) {
+    const { stdout } = await execAsync(
+      `yt-dlp --dump-single-json --no-playlist "${query}"`
+    );
+    const info = JSON.parse(stdout);
+    return {
+      title: info.title,
+      url: `https://www.youtube.com/watch?v=${info.id}`,
+      duration: info.duration,
+      author: info.uploader,
+      thumbnail: info.thumbnail,
+    };
+  }
+  // Search query — use play-dl (fast, no auth needed for search)
+  const results = await play.search(query, { limit: 1 });
+  if (!results.length) throw new Error('No results found.');
+  const r = results[0];
+  return {
+    title: r.title,
+    url: r.url,
+    duration: r.durationInSec,
+    author: r.channel?.name,
+    thumbnail: r.thumbnails?.[0]?.url,
+  };
+}
+
+// ── Playback ──────────────────────────────────────────────────────────────────
 async function startPlaying(state) {
   if (!state.queue.length || !state.connection) return;
   const track = state.queue.shift();
   state.current = track;
   try {
-    const stream = ytdl(track.url, {
-      filter: 'audioonly',
-      quality: 'highestaudio',
-      highWaterMark: 1 << 25,
-    });
-    const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+    const resource = await getAudioResource(track.url);
     state.player.play(resource);
     if (state.textChannel) state.textChannel.send({ embeds: [nowPlayingEmbed(track)] });
   } catch (err) {
@@ -95,6 +141,7 @@ async function ensureVoice(message, state) {
   return true;
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function fmtDuration(sec) {
   if (!sec) return 'Live';
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
@@ -102,10 +149,7 @@ function fmtDuration(sec) {
 }
 
 function nowPlayingEmbed(track) {
-  const embed = new EmbedBuilder()
-    .setTitle('🎵 Now Playing')
-    .setDescription(`[${track.title}](${track.url})`)
-    .setColor(0xff0000);
+  const embed = new EmbedBuilder().setTitle('🎵 Now Playing').setDescription(`[${track.title}](${track.url})`).setColor(0xff0000);
   if (track.duration) embed.addFields({ name: 'Duration', value: fmtDuration(track.duration), inline: true });
   if (track.author) embed.addFields({ name: 'Channel', value: track.author, inline: true });
   if (track.thumbnail) embed.setThumbnail(track.thumbnail);
@@ -114,32 +158,7 @@ function nowPlayingEmbed(track) {
 
 function sanitize(name) { return name.replace(/[/\\?%*:|"<>]/g, '-').trim(); }
 
-async function resolveTrack(query) {
-  // If it's a YouTube URL, get info directly
-  if (ytdl.validateURL(query)) {
-    const info = await ytdl.getInfo(query);
-    const v = info.videoDetails;
-    return {
-      title: v.title,
-      url: v.video_url,
-      duration: parseInt(v.lengthSeconds),
-      author: v.author.name,
-      thumbnail: v.thumbnails[v.thumbnails.length - 1]?.url,
-    };
-  }
-  // Otherwise search with play-dl
-  const results = await play.search(query, { limit: 1 });
-  if (!results.length) throw new Error('No results found.');
-  const r = results[0];
-  return {
-    title: r.title,
-    url: r.url,
-    duration: r.durationInSec,
-    author: r.channel?.name,
-    thumbnail: r.thumbnails?.[0]?.url,
-  };
-}
-
+// ── Commands ──────────────────────────────────────────────────────────────────
 const commands = {};
 
 commands.play = async (message, args) => {
@@ -154,14 +173,8 @@ commands.play = async (message, args) => {
       await status.delete().catch(() => {});
       await startPlaying(state);
     } else {
-      const embed = new EmbedBuilder()
-        .setTitle('➕ Added to Queue')
-        .setDescription(`[${track.title}](${track.url})`)
-        .setColor(0x00bfff)
-        .addFields(
-          { name: 'Position', value: `#${state.queue.length}`, inline: true },
-          { name: 'Duration', value: fmtDuration(track.duration), inline: true }
-        );
+      const embed = new EmbedBuilder().setTitle('➕ Added to Queue').setDescription(`[${track.title}](${track.url})`).setColor(0x00bfff)
+        .addFields({ name: 'Position', value: `#${state.queue.length}`, inline: true }, { name: 'Duration', value: fmtDuration(track.duration), inline: true });
       if (track.thumbnail) embed.setThumbnail(track.thumbnail);
       await status.edit({ content: '', embeds: [embed] });
     }
@@ -174,15 +187,8 @@ commands.search = async (message, args) => {
   try {
     const results = await play.search(args.join(' '), { limit: 5 });
     if (!results.length) return status.edit('❌ No results found.');
-    const embed = new EmbedBuilder()
-      .setTitle(`🔍 Results for: ${args.join(' ')}`)
-      .setColor(0xff0000)
-      .setFooter({ text: 'Use !play <title or URL> to queue a result' });
-    results.forEach((r, i) => embed.addFields({
-      name: `${i+1}. ${r.title}`,
-      value: `[Watch](${r.url}) | \`${fmtDuration(r.durationInSec)}\``,
-      inline: false,
-    }));
+    const embed = new EmbedBuilder().setTitle(`🔍 Results for: ${args.join(' ')}`).setColor(0xff0000).setFooter({ text: 'Use !play <title or URL> to queue a result' });
+    results.forEach((r, i) => embed.addFields({ name: `${i+1}. ${r.title}`, value: `[Watch](${r.url}) | \`${fmtDuration(r.durationInSec)}\``, inline: false }));
     await status.edit({ content: '', embeds: [embed] });
   } catch (err) { await status.edit(`❌ Search failed: \`${err.message}\``); }
 };
@@ -197,11 +203,7 @@ commands.download = async (message, args) => {
     await status.edit(`⏬ Downloading **${track.title}**...`);
     fs.mkdirSync(tmpDir, { recursive: true });
     const outputPath = path.join(tmpDir, `${sanitize(track.title)}.mp4`);
-    await new Promise((resolve, reject) => {
-      ytdl(track.url, { quality: 'highest' })
-        .pipe(fs.createWriteStream(outputPath))
-        .on('finish', resolve).on('error', reject);
-    });
+    await execAsync(`yt-dlp -f "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 -o "${outputPath}" --no-playlist "${track.url}"`);
     const sizeMB = fs.statSync(outputPath).size / (1024 * 1024);
     if (sizeMB > 25) return status.edit(`❌ File is ${sizeMB.toFixed(1)} MB — too large. Try \`!play\` to stream it.`);
     await status.edit(`✅ Sending **${track.title}** (${sizeMB.toFixed(1)} MB)...`);
@@ -221,11 +223,7 @@ commands.audio = async (message, args) => {
     await status.edit(`⏬ Downloading audio for **${track.title}**...`);
     fs.mkdirSync(tmpDir, { recursive: true });
     const outputPath = path.join(tmpDir, `${sanitize(track.title)}.mp3`);
-    await new Promise((resolve, reject) => {
-      const stream = ytdl(track.url, { filter: 'audioonly', quality: 'highestaudio' });
-      ffmpeg(stream).audioBitrate(192).toFormat('mp3').save(outputPath)
-        .on('end', resolve).on('error', reject);
-    });
+    await execAsync(`yt-dlp -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K -o "${outputPath}" --no-playlist "${track.url}"`);
     const sizeMB = fs.statSync(outputPath).size / (1024 * 1024);
     if (sizeMB > 25) return status.edit(`❌ File is ${sizeMB.toFixed(1)} MB — too large.`);
     await status.edit(`✅ Sending **${track.title}** (${sizeMB.toFixed(1)} MB)...`);
