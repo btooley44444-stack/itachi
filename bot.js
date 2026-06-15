@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, Events } = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -6,6 +6,7 @@ const {
   AudioPlayerStatus,
   VoiceConnectionStatus,
   entersState,
+  StreamType,
 } = require('@discordjs/voice');
 const play = require('play-dl');
 const ytdl = require('@distube/ytdl-core');
@@ -55,8 +56,12 @@ async function startPlaying(state) {
   const track = state.queue.shift();
   state.current = track;
   try {
-    const stream = await play.stream(track.url);
-    const resource = createAudioResource(stream.stream, { inputType: stream.type });
+    const stream = ytdl(track.url, {
+      filter: 'audioonly',
+      quality: 'highestaudio',
+      highWaterMark: 1 << 25,
+    });
+    const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
     state.player.play(resource);
     if (state.textChannel) state.textChannel.send({ embeds: [nowPlayingEmbed(track)] });
   } catch (err) {
@@ -97,20 +102,42 @@ function fmtDuration(sec) {
 }
 
 function nowPlayingEmbed(track) {
-  const embed = new EmbedBuilder().setTitle('🎵 Now Playing').setDescription(`[${track.title}](${track.url})`).setColor(0xff0000);
-  if (track.durationInSec) embed.addFields({ name: 'Duration', value: fmtDuration(track.durationInSec), inline: true });
-  if (track.channel?.name) embed.addFields({ name: 'Channel', value: track.channel.name, inline: true });
-  if (track.thumbnails?.[0]?.url) embed.setThumbnail(track.thumbnails[0].url);
+  const embed = new EmbedBuilder()
+    .setTitle('🎵 Now Playing')
+    .setDescription(`[${track.title}](${track.url})`)
+    .setColor(0xff0000);
+  if (track.duration) embed.addFields({ name: 'Duration', value: fmtDuration(track.duration), inline: true });
+  if (track.author) embed.addFields({ name: 'Channel', value: track.author, inline: true });
+  if (track.thumbnail) embed.setThumbnail(track.thumbnail);
   return embed;
 }
 
 function sanitize(name) { return name.replace(/[/\\?%*:|"<>]/g, '-').trim(); }
 
-async function resolveUrl(query) {
-  if (play.yt_validate(query) === 'video') return query;
+async function resolveTrack(query) {
+  // If it's a YouTube URL, get info directly
+  if (ytdl.validateURL(query)) {
+    const info = await ytdl.getInfo(query);
+    const v = info.videoDetails;
+    return {
+      title: v.title,
+      url: v.video_url,
+      duration: parseInt(v.lengthSeconds),
+      author: v.author.name,
+      thumbnail: v.thumbnails[v.thumbnails.length - 1]?.url,
+    };
+  }
+  // Otherwise search with play-dl
   const results = await play.search(query, { limit: 1 });
   if (!results.length) throw new Error('No results found.');
-  return results[0].url;
+  const r = results[0];
+  return {
+    title: r.title,
+    url: r.url,
+    duration: r.durationInSec,
+    author: r.channel?.name,
+    thumbnail: r.thumbnails?.[0]?.url,
+  };
 }
 
 const commands = {};
@@ -121,19 +148,21 @@ commands.play = async (message, args) => {
   if (!await ensureVoice(message, state)) return;
   const status = await message.reply('🔍 Searching...');
   try {
-    const url = await resolveUrl(args.join(' '));
-    const details = play.yt_validate(url) === 'video'
-      ? (await play.video_info(url)).video_details
-      : (await play.search(args.join(' '), { limit: 1 }))[0];
-    const track = { title: details.title || 'Unknown', url: details.url, durationInSec: details.durationInSec, channel: details.channel, thumbnails: details.thumbnails };
+    const track = await resolveTrack(args.join(' '));
     state.queue.push(track);
     if (state.player.state.status === AudioPlayerStatus.Idle) {
       await status.delete().catch(() => {});
       await startPlaying(state);
     } else {
-      const embed = new EmbedBuilder().setTitle('➕ Added to Queue').setDescription(`[${track.title}](${track.url})`).setColor(0x00bfff)
-        .addFields({ name: 'Position', value: `#${state.queue.length}`, inline: true }, { name: 'Duration', value: fmtDuration(track.durationInSec), inline: true });
-      if (track.thumbnails?.[0]?.url) embed.setThumbnail(track.thumbnails[0].url);
+      const embed = new EmbedBuilder()
+        .setTitle('➕ Added to Queue')
+        .setDescription(`[${track.title}](${track.url})`)
+        .setColor(0x00bfff)
+        .addFields(
+          { name: 'Position', value: `#${state.queue.length}`, inline: true },
+          { name: 'Duration', value: fmtDuration(track.duration), inline: true }
+        );
+      if (track.thumbnail) embed.setThumbnail(track.thumbnail);
       await status.edit({ content: '', embeds: [embed] });
     }
   } catch (err) { await status.edit(`❌ Error: \`${err.message}\``); }
@@ -145,8 +174,15 @@ commands.search = async (message, args) => {
   try {
     const results = await play.search(args.join(' '), { limit: 5 });
     if (!results.length) return status.edit('❌ No results found.');
-    const embed = new EmbedBuilder().setTitle(`🔍 Results for: ${args.join(' ')}`).setColor(0xff0000).setFooter({ text: 'Use !play <title or URL> to queue a result' });
-    results.forEach((r, i) => embed.addFields({ name: `${i+1}. ${r.title}`, value: `[Watch](${r.url}) | \`${fmtDuration(r.durationInSec)}\``, inline: false }));
+    const embed = new EmbedBuilder()
+      .setTitle(`🔍 Results for: ${args.join(' ')}`)
+      .setColor(0xff0000)
+      .setFooter({ text: 'Use !play <title or URL> to queue a result' });
+    results.forEach((r, i) => embed.addFields({
+      name: `${i+1}. ${r.title}`,
+      value: `[Watch](${r.url}) | \`${fmtDuration(r.durationInSec)}\``,
+      inline: false,
+    }));
     await status.edit({ content: '', embeds: [embed] });
   } catch (err) { await status.edit(`❌ Search failed: \`${err.message}\``); }
 };
@@ -156,22 +192,20 @@ commands.download = async (message, args) => {
   const status = await message.reply('⏳ Fetching video info...');
   const tmpDir = path.join('/tmp', `dl_${message.id}`);
   try {
-    const url = await resolveUrl(args.join(' '));
-    const info = await ytdl.getInfo(url);
-    const title = sanitize(info.videoDetails.title);
-    const duration = parseInt(info.videoDetails.lengthSeconds);
-    if (duration > 600) return status.edit('❌ Video is over 10 minutes. Use `!play` to stream it instead.');
-    await status.edit(`⏬ Downloading **${info.videoDetails.title}**...`);
+    const track = await resolveTrack(args.join(' '));
+    if (track.duration > 600) return status.edit('❌ Video is over 10 minutes. Use `!play` to stream it instead.');
+    await status.edit(`⏬ Downloading **${track.title}**...`);
     fs.mkdirSync(tmpDir, { recursive: true });
-    const outputPath = path.join(tmpDir, `${title}.mp4`);
+    const outputPath = path.join(tmpDir, `${sanitize(track.title)}.mp4`);
     await new Promise((resolve, reject) => {
-      ytdl(url, { quality: 'highest' }).pipe(fs.createWriteStream(outputPath))
+      ytdl(track.url, { quality: 'highest' })
+        .pipe(fs.createWriteStream(outputPath))
         .on('finish', resolve).on('error', reject);
     });
     const sizeMB = fs.statSync(outputPath).size / (1024 * 1024);
     if (sizeMB > 25) return status.edit(`❌ File is ${sizeMB.toFixed(1)} MB — too large. Try \`!play\` to stream it.`);
-    await status.edit(`✅ Sending **${info.videoDetails.title}** (${sizeMB.toFixed(1)} MB)...`);
-    await message.channel.send({ files: [{ attachment: outputPath, name: `${title}.mp4` }] });
+    await status.edit(`✅ Sending **${track.title}** (${sizeMB.toFixed(1)} MB)...`);
+    await message.channel.send({ files: [{ attachment: outputPath, name: `${sanitize(track.title)}.mp4` }] });
     await status.delete().catch(() => {});
   } catch (err) { await status.edit(`❌ Error: \`${err.message}\``); }
   finally { fs.rmSync(tmpDir, { recursive: true, force: true }); }
@@ -182,22 +216,20 @@ commands.audio = async (message, args) => {
   const status = await message.reply('⏳ Fetching audio info...');
   const tmpDir = path.join('/tmp', `audio_${message.id}`);
   try {
-    const url = await resolveUrl(args.join(' '));
-    const info = await ytdl.getInfo(url);
-    const title = sanitize(info.videoDetails.title);
-    const duration = parseInt(info.videoDetails.lengthSeconds);
-    if (duration > 1200) return status.edit('❌ Track is over 20 minutes — too long.');
-    await status.edit(`⏬ Downloading audio for **${info.videoDetails.title}**...`);
+    const track = await resolveTrack(args.join(' '));
+    if (track.duration > 1200) return status.edit('❌ Track is over 20 minutes — too long.');
+    await status.edit(`⏬ Downloading audio for **${track.title}**...`);
     fs.mkdirSync(tmpDir, { recursive: true });
-    const outputPath = path.join(tmpDir, `${title}.mp3`);
+    const outputPath = path.join(tmpDir, `${sanitize(track.title)}.mp3`);
     await new Promise((resolve, reject) => {
-      const stream = ytdl(url, { filter: 'audioonly', quality: 'highestaudio' });
-      ffmpeg(stream).audioBitrate(192).toFormat('mp3').save(outputPath).on('end', resolve).on('error', reject);
+      const stream = ytdl(track.url, { filter: 'audioonly', quality: 'highestaudio' });
+      ffmpeg(stream).audioBitrate(192).toFormat('mp3').save(outputPath)
+        .on('end', resolve).on('error', reject);
     });
     const sizeMB = fs.statSync(outputPath).size / (1024 * 1024);
     if (sizeMB > 25) return status.edit(`❌ File is ${sizeMB.toFixed(1)} MB — too large.`);
-    await status.edit(`✅ Sending **${info.videoDetails.title}** (${sizeMB.toFixed(1)} MB)...`);
-    await message.channel.send({ files: [{ attachment: outputPath, name: `${title}.mp3` }] });
+    await status.edit(`✅ Sending **${track.title}** (${sizeMB.toFixed(1)} MB)...`);
+    await message.channel.send({ files: [{ attachment: outputPath, name: `${sanitize(track.title)}.mp3` }] });
     await status.delete().catch(() => {});
   } catch (err) { await status.edit(`❌ Error: \`${err.message}\``); }
   finally { fs.rmSync(tmpDir, { recursive: true, force: true }); }
@@ -214,8 +246,8 @@ commands.queue = async (message) => {
   const state = getGuild(message.guild.id);
   if (!state.current && !state.queue.length) return message.reply('📭 The queue is empty.');
   const embed = new EmbedBuilder().setTitle('🎵 Queue').setColor(0xff0000);
-  if (state.current) embed.addFields({ name: '▶️ Now Playing', value: `[${state.current.title}](${state.current.url}) | \`${fmtDuration(state.current.durationInSec)}\``, inline: false });
-  state.queue.slice(0, 9).forEach((t, i) => embed.addFields({ name: `${i+1}. ${t.title}`, value: `[Link](${t.url}) | \`${fmtDuration(t.durationInSec)}\``, inline: false }));
+  if (state.current) embed.addFields({ name: '▶️ Now Playing', value: `[${state.current.title}](${state.current.url}) | \`${fmtDuration(state.current.duration)}\``, inline: false });
+  state.queue.slice(0, 9).forEach((t, i) => embed.addFields({ name: `${i+1}. ${t.title}`, value: `[Link](${t.url}) | \`${fmtDuration(t.duration)}\``, inline: false }));
   if (state.queue.length > 9) embed.setFooter({ text: `…and ${state.queue.length - 9} more` });
   await message.reply({ embeds: [embed] });
 };
@@ -265,7 +297,7 @@ commands.help = async (message) => {
 
 const aliases = { p:'play', s:'search', dl:'download', save:'download', mp3:'audio', np:'nowplaying', q:'queue', dc:'leave', disconnect:'leave', next:'skip', sk:'skip' };
 
-client.on('messageCreate', async (message) => {
+client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guild || !message.content.startsWith(PREFIX)) return;
   const [rawCmd, ...args] = message.content.slice(PREFIX.length).trim().split(/\s+/);
   const cmd = aliases[rawCmd.toLowerCase()] ?? rawCmd.toLowerCase();
@@ -274,7 +306,7 @@ client.on('messageCreate', async (message) => {
   catch (err) { console.error(`[${cmd}] error:`, err); message.reply(`❌ Unexpected error: \`${err.message}\``).catch(() => {}); }
 });
 
-client.once('ready', () => {
+client.once(Events.ClientReady, () => {
   console.log(`✅ Online as ${client.user.tag}`);
   client.user.setActivity('!help | YouTube', { type: 2 });
 });
