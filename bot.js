@@ -9,8 +9,7 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const play = require('play-dl');
-const ffmpeg = require('fluent-ffmpeg');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
@@ -54,23 +53,28 @@ function getGuild(guildId) {
 
 // ── yt-dlp helpers ────────────────────────────────────────────────────────────
 async function getAudioResource(url) {
-  // Get the direct CDN audio URL from yt-dlp (no login needed)
-  const { stdout } = await execAsync(
-    `yt-dlp -f "bestaudio[ext=webm]/bestaudio/best" -g --no-playlist "${url}"`
-  );
-  const streamUrl = stdout.trim().split('\n')[0];
+  // Pipe yt-dlp → ffmpeg → discord (no login needed, reliable)
+  const ytdlpProc = spawn('yt-dlp', [
+    '-f', 'bestaudio',
+    '-o', '-',
+    '--quiet',
+    '--no-playlist',
+    url,
+  ]);
 
-  const ffmpegStream = ffmpeg(streamUrl)
-    .inputOptions(['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'])
-    .noVideo()
-    .audioCodec('libopus')
-    .audioFrequency(48000)
-    .audioChannels(2)
-    .format('ogg')
-    .on('error', (err) => console.error('FFmpeg error:', err.message))
-    .pipe();
+  const ffmpegProc = spawn('ffmpeg', [
+    '-i', 'pipe:0',
+    '-vn',
+    '-ar', '48000',
+    '-ac', '2',
+    '-f', 's16le',
+    'pipe:1',
+  ], { stdio: ['pipe', 'pipe', 'ignore'] });
 
-  return createAudioResource(ffmpegStream, { inputType: StreamType.OggOpus });
+  ytdlpProc.stdout.pipe(ffmpegProc.stdin);
+  ytdlpProc.stderr.on('data', (d) => console.error('yt-dlp:', d.toString()));
+
+  return createAudioResource(ffmpegProc.stdout, { inputType: StreamType.Raw });
 }
 
 async function resolveTrack(query) {
