@@ -72,7 +72,7 @@ function searchButtons(index, total) {
 }
 
 // ── yt-dlp helpers ────────────────────────────────────────────────────────────
-const YTDLP_ARGS = ['--no-playlist', '--extractor-args', 'youtube:player_client=tv,web'];
+const YTDLP_ARGS = ['--no-playlist', '--extractor-args', 'youtube:player_client=android,web'];
 
 async function getAudioResource(url) {
   const ytdlpProc = spawn('yt-dlp', ['-f', 'bestaudio', '-o', '-', '--quiet', ...YTDLP_ARGS, url]);
