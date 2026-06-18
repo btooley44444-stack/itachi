@@ -150,32 +150,40 @@ async function getAudioResource(url) {
   return createAudioResource(ffmpegProc.stdout, { inputType: StreamType.Raw });
 }
 
-// ── Cobalt.tools downloader (no bot detection, no cookies needed) ─────────────
-function streamToFile(url, dest) {
+// ── Cobalt downloader — auto-selects a working public instance ────────────────
+let _cobaltHost = null;
+
+async function getCobaltHost() {
+  if (_cobaltHost) return _cobaltHost;
   return new Promise((resolve, reject) => {
-    const proto = url.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(dest);
-    proto.get(url, res => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        file.close();
-        fs.unlink(dest, () => {});
-        return streamToFile(res.headers.location, dest).then(resolve).catch(reject);
-      }
-      if (res.statusCode !== 200) {
-        file.close();
-        return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
-      }
-      res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(); });
-    }).on('error', err => { fs.unlink(dest, () => {}); reject(err); });
+    https.get({
+      hostname: 'instances.cobalt.best',
+      path: '/instances.json',
+      headers: { 'User-Agent': 'discord-ytbot/1.0' },
+    }, res => {
+      let out = '';
+      res.on('data', d => out += d);
+      res.on('end', () => {
+        try {
+          const list = JSON.parse(out).flat();
+          const pick = list
+            .filter(i => i.online?.api === true && i.cors === true && i.services?.youtube === true && i.score >= 50)
+            .sort((a, b) => b.score - a.score)[0];
+          if (!pick) return reject(new Error('No working cobalt instance found'));
+          _cobaltHost = pick.api;
+          console.log(`[cobalt] using instance: ${_cobaltHost}`);
+          resolve(_cobaltHost);
+        } catch { reject(new Error('Failed to parse cobalt instance list')); }
+      });
+    }).on('error', reject);
   });
 }
 
 function cobaltGetUrl(videoUrl, opts = {}) {
-  return new Promise((resolve, reject) => {
+  return getCobaltHost().then(host => new Promise((resolve, reject) => {
     const body = Buffer.from(JSON.stringify({ url: videoUrl, filenameStyle: 'basic', ...opts }));
     const req = https.request({
-      hostname: 'api.cobalt.tools',
+      hostname: host,
       path: '/',
       method: 'POST',
       headers: {
@@ -189,16 +197,19 @@ function cobaltGetUrl(videoUrl, opts = {}) {
       res.on('end', () => {
         try {
           const data = JSON.parse(out);
-          if (data.status === 'error') return reject(new Error(data.error?.code ?? 'Cobalt error'));
+          if (data.status === 'error') {
+            _cobaltHost = null; // reset so next attempt tries a fresh instance
+            return reject(new Error(data.error?.code ?? 'Cobalt error'));
+          }
           if (!data.url) return reject(new Error('No download URL returned'));
           resolve(data.url);
-        } catch { reject(new Error('Invalid response from cobalt')); }
+        } catch { reject(new Error('Invalid response from cobalt instance')); }
       });
     });
     req.on('error', reject);
     req.write(body);
     req.end();
-  });
+  }));
 }
 
 async function downloadMp4(url, outputPath) {
