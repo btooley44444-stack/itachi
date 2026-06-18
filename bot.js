@@ -184,16 +184,25 @@ async function phptoolsGetUrl(videoUrl) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://www.phptools.org/youtube/index.php',
         'Origin': 'https://www.phptools.org',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json, text/plain, */*',
       },
     }, res => {
       let out = '';
       res.on('data', d => out += d);
       res.on('end', () => {
-        try {
-          const data = JSON.parse(out);
-          if (!data.ok || !data.public_url) reject(new Error(data.error || 'No download URL returned'));
-          else resolve(data.public_url);
-        } catch { reject(new Error('Unexpected response from downloader')); }
+        // Response may be streamed progress lines ending with a JSON line
+        // Try each line in reverse until one parses as valid JSON with public_url
+        const lines = out.trim().split('\n').reverse();
+        for (const line of lines) {
+          try {
+            const data = JSON.parse(line.trim());
+            if (data.public_url) return resolve(data.public_url);
+            if (data.error) return reject(new Error(data.error));
+          } catch {}
+        }
+        console.error('[phptools] raw response:', out.slice(0, 300));
+        reject(new Error('Could not find download URL in response'));
       });
     });
     req.on('error', reject);
