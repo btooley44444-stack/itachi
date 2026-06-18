@@ -10,6 +10,8 @@ const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 const execAsync = promisify(exec);
 
@@ -148,16 +150,65 @@ async function getAudioResource(url) {
   return createAudioResource(ffmpegProc.stdout, { inputType: StreamType.Raw });
 }
 
+// ── Cobalt API downloader (no bot detection, no cookies needed) ───────────────
+function cobaltPost(videoUrl, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const body = Buffer.from(JSON.stringify({ url: videoUrl, filenameStyle: 'basic', ...opts }));
+    const req = https.request({
+      hostname: 'api.cobalt.tools',
+      path: '/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Content-Length': body.length,
+      },
+    }, res => {
+      let out = '';
+      res.on('data', d => out += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(out)); }
+        catch { reject(new Error('Invalid response from cobalt')); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function streamToFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const proto = url.startsWith('https') ? https : http;
+    const file = fs.createWriteStream(dest);
+    proto.get(url, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        file.close();
+        fs.unlink(dest, () => {});
+        return streamToFile(res.headers.location, dest).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        file.close();
+        return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+      }
+      res.pipe(file);
+      file.on('finish', () => { file.close(); resolve(); });
+    }).on('error', err => { fs.unlink(dest, () => {}); reject(err); });
+  });
+}
+
 async function downloadMp4(url, outputPath) {
-  await execAsync(
-    `yt-dlp -f "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 ${YTDLP_ARGS.join(' ')} -o "${outputPath}" "${url}"`
-  );
+  const data = await cobaltPost(url, { videoQuality: '720' });
+  if (data.status === 'error') throw new Error(data.error?.code ?? 'Cobalt error');
+  if (!data.url) throw new Error('Cobalt returned no download link');
+  await streamToFile(data.url, outputPath);
 }
 
 async function downloadMp3(url, outputPath) {
-  await execAsync(
-    `yt-dlp -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K ${YTDLP_ARGS.join(' ')} -o "${outputPath}" "${url}"`
-  );
+  const data = await cobaltPost(url, { downloadMode: 'audio', audioFormat: 'mp3', audioBitrate: '192' });
+  if (data.status === 'error') throw new Error(data.error?.code ?? 'Cobalt error');
+  if (!data.url) throw new Error('Cobalt returned no download link');
+  await streamToFile(data.url, outputPath);
 }
 
 // ── Guild state ───────────────────────────────────────────────────────────────
