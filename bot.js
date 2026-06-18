@@ -72,7 +72,17 @@ function searchButtons(index, total) {
 }
 
 // ── yt-dlp helpers ────────────────────────────────────────────────────────────
-const YTDLP_ARGS = ['--no-playlist', '--extractor-args', 'youtube:player_client=android,web'];
+// Place a cookies.txt file (exported from your browser while logged into YouTube)
+// in the same folder as this bot file to fix YouTube bot-detection errors.
+const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+const COOKIES_EXIST = fs.existsSync(COOKIES_PATH);
+
+const YTDLP_ARGS = [
+  '--no-playlist',
+  '--extractor-args', 'youtube:player_client=android', // 'web' client triggers bot detection
+  '--sleep-requests', '1',                             // small delay to avoid 429 rate limits
+  ...(COOKIES_EXIST ? ['--cookies', COOKIES_PATH] : []),
+];
 
 async function getAudioResource(url) {
   const ytdlpProc = spawn('yt-dlp', ['-f', 'bestaudio', '-o', '-', '--quiet', ...YTDLP_ARGS, url]);
@@ -490,6 +500,12 @@ client.on(Events.MessageCreate, async (message) => {
 
 client.once(Events.ClientReady, () => {
   console.log(`✅ Online as ${client.user.tag}`);
+  if (!COOKIES_EXIST) {
+    console.warn('⚠️  cookies.txt not found — YouTube downloads may fail with bot-detection errors.');
+    console.warn('   Export cookies from your browser at youtube.com and place cookies.txt next to bot.js');
+  } else {
+    console.log('🍪 cookies.txt loaded');
+  }
   client.user.setActivity('bren is cool', { type: 2 });
 });
 
