@@ -6,7 +6,6 @@ const {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
   AudioPlayerStatus, VoiceConnectionStatus, entersState, StreamType,
 } = require('@discordjs/voice');
-const play = require('play-dl');
 const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
@@ -76,13 +75,68 @@ function searchButtons(index, total) {
 // in the same folder as this bot file to fix YouTube bot-detection errors.
 const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
 const COOKIES_EXIST = fs.existsSync(COOKIES_PATH);
+const COOKIES_ARG = COOKIES_EXIST ? ['--cookies', COOKIES_PATH] : [];
 
+// Used for downloads/streaming — includes rate-limit delay
 const YTDLP_ARGS = [
   '--no-playlist',
-  '--extractor-args', 'youtube:player_client=android', // 'web' client triggers bot detection
-  '--sleep-requests', '1',                             // small delay to avoid 429 rate limits
-  ...(COOKIES_EXIST ? ['--cookies', COOKIES_PATH] : []),
+  '--extractor-args', 'youtube:player_client=android',
+  '--sleep-requests', '1',
+  ...COOKIES_ARG,
 ];
+
+// Used for metadata (search, info) — no delay needed
+const YTDLP_META_ARGS = [
+  '--no-playlist',
+  '--extractor-args', 'youtube:player_client=android',
+  ...COOKIES_ARG,
+];
+
+// Run yt-dlp and return stdout as a string
+function ytdlpRun(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('yt-dlp', args);
+    let out = '', err = '';
+    proc.stdout.on('data', d => out += d);
+    proc.stderr.on('data', d => err += d);
+    proc.on('close', code => code === 0 ? resolve(out) : reject(new Error(err.trim() || `yt-dlp exited ${code}`)));
+  });
+}
+
+// Search YouTube — returns array of result objects shaped like play-dl results
+async function ytSearch(query, limit = 10) {
+  const out = await ytdlpRun([
+    `ytsearch${limit}:${query}`,
+    '--dump-json', '--flat-playlist', '--quiet', '--no-warnings',
+    ...YTDLP_META_ARGS,
+  ]);
+  return out.trim().split('\n').filter(Boolean).map(line => {
+    const v = JSON.parse(line);
+    return {
+      title:       v.title ?? 'Unknown',
+      url:         v.url?.startsWith('http') ? v.url : `https://www.youtube.com/watch?v=${v.id}`,
+      durationInSec: v.duration ?? 0,
+      views:       v.view_count ?? 0,
+      channel:     { name: v.channel || v.uploader || 'Unknown' },
+      thumbnails:  [{ url: v.thumbnail || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg` }],
+    };
+  });
+}
+
+// Fetch metadata for a single video URL
+async function ytInfo(url) {
+  const out = await ytdlpRun([
+    url, '--dump-json', '--quiet', '--no-warnings', ...YTDLP_META_ARGS,
+  ]);
+  const v = JSON.parse(out.trim());
+  return {
+    title:     v.title ?? 'Unknown',
+    url:       `https://www.youtube.com/watch?v=${v.id}`,
+    duration:  v.duration ?? 0,   // track objects use 'duration'
+    author:    v.channel || v.uploader || 'Unknown',
+    thumbnail: v.thumbnail || null,
+  };
+}
 
 async function getAudioResource(url) {
   const ytdlpProc = spawn('yt-dlp', ['-f', 'bestaudio', '-o', '-', '--quiet', ...YTDLP_ARGS, url]);
@@ -182,12 +236,11 @@ async function ensureVoice(message, state) {
 // ── Resolve a track from URL or search query ──────────────────────────────────
 async function resolveTrack(query) {
   if (query.includes('youtube.com') || query.includes('youtu.be')) {
-    const info = await play.video_info(query);
-    const v = info.video_details;
-    return { title: v.title, url: v.url, duration: v.durationInSec, author: v.channel?.name, thumbnail: v.thumbnails?.[v.thumbnails.length - 1]?.url };
+    return ytInfo(query);
   }
-  const r = (await play.search(query, { limit: 1 }))[0];
-  if (!r) throw new Error('No results found.');
+  const results = await ytSearch(query, 1);
+  if (!results.length) throw new Error('No results found.');
+  const r = results[0];
   return { title: r.title, url: r.url, duration: r.durationInSec, author: r.channel?.name, thumbnail: r.thumbnails?.[0]?.url };
 }
 
@@ -223,7 +276,7 @@ commands.yt = async (message, args) => {
   if (!args.length) return message.reply('❌ Provide a search query. e.g. `.yt never gonna give you up`');
   const status = await message.reply('🔍 Searching YouTube...');
   try {
-    const results = await play.search(args.join(' '), { limit: 10 });
+    const results = await ytSearch(args.join(' '), 10);
     if (!results.length) return status.edit('❌ No results found.');
     searchSessions.set(message.author.id, { results, index: 0 });
     await status.edit({ content: '', embeds: [searchEmbed(results, 0)], components: [searchButtons(0, results.length)] });
@@ -288,9 +341,8 @@ commands.mp3 = async (message, args) => {
   const status = await message.reply('⏳ Fetching info...');
   const tmpDir = path.join('/tmp', `mp3_${Date.now()}`);
   try {
-    const info = await play.video_info(url);
-    const v = info.video_details;
-    if (v.durationInSec > 1200) return status.edit('❌ Track is over 20 minutes — too long.');
+    const v = await ytInfo(url);
+    if (v.duration > 1200) return status.edit('❌ Track is over 20 minutes — too long.');
     fs.mkdirSync(tmpDir, { recursive: true });
     const outputPath = path.join(tmpDir, `${sanitize(v.title)}.mp3`);
     await status.edit(`⏬ Downloading audio for **${v.title}**...`);
