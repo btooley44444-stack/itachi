@@ -150,33 +150,7 @@ async function getAudioResource(url) {
   return createAudioResource(ffmpegProc.stdout, { inputType: StreamType.Raw });
 }
 
-// ── Cobalt API downloader (no bot detection, no cookies needed) ───────────────
-function cobaltPost(videoUrl, opts = {}) {
-  return new Promise((resolve, reject) => {
-    const body = Buffer.from(JSON.stringify({ url: videoUrl, filenameStyle: 'basic', ...opts }));
-    const req = https.request({
-      hostname: 'api.cobalt.tools',
-      path: '/',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Content-Length': body.length,
-      },
-    }, res => {
-      let out = '';
-      res.on('data', d => out += d);
-      res.on('end', () => {
-        try { resolve(JSON.parse(out)); }
-        catch { reject(new Error('Invalid response from cobalt')); }
-      });
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
-}
-
+// ── phptools.org downloader ───────────────────────────────────────────────────
 function streamToFile(url, dest) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith('https') ? https : http;
@@ -197,18 +171,51 @@ function streamToFile(url, dest) {
   });
 }
 
+async function phptoolsGetUrl(videoUrl) {
+  const body = Buffer.from(`yt_url=${encodeURIComponent(videoUrl)}`);
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'www.phptools.org',
+      path: '/youtube/index.php',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': body.length,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://www.phptools.org/youtube/index.php',
+        'Origin': 'https://www.phptools.org',
+      },
+    }, res => {
+      let out = '';
+      res.on('data', d => out += d);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(out);
+          if (!data.ok || !data.public_url) reject(new Error(data.error || 'No download URL returned'));
+          else resolve(data.public_url);
+        } catch { reject(new Error('Unexpected response from downloader')); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 async function downloadMp4(url, outputPath) {
-  const data = await cobaltPost(url, { videoQuality: '720' });
-  if (data.status === 'error') throw new Error(data.error?.code ?? 'Cobalt error');
-  if (!data.url) throw new Error('Cobalt returned no download link');
-  await streamToFile(data.url, outputPath);
+  const publicUrl = await phptoolsGetUrl(url);
+  await streamToFile(publicUrl, outputPath);
 }
 
 async function downloadMp3(url, outputPath) {
-  const data = await cobaltPost(url, { downloadMode: 'audio', audioFormat: 'mp3', audioBitrate: '192' });
-  if (data.status === 'error') throw new Error(data.error?.code ?? 'Cobalt error');
-  if (!data.url) throw new Error('Cobalt returned no download link');
-  await streamToFile(data.url, outputPath);
+  const tmpPath = outputPath.replace(/\.mp3$/, '_tmp.mp4');
+  try {
+    const publicUrl = await phptoolsGetUrl(url);
+    await streamToFile(publicUrl, tmpPath);
+    await execAsync(`ffmpeg -i "${tmpPath}" -vn -ar 44100 -ac 2 -b:a 192k "${outputPath}" -y`);
+  } finally {
+    if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+  }
 }
 
 // ── Guild state ───────────────────────────────────────────────────────────────
