@@ -156,6 +156,7 @@ function findVideos(obj, found = []) {
 
 async function ytSearch(query, limit = 10) {
   const data = await innertubePost('search', { query, params: 'EgIQAQ==', context: ANDROID_CTX });
+  console.log('[search raw]', JSON.stringify(data).slice(0, 500));
   const items = findVideos(data).slice(0, limit);
   if (!items.length) throw new Error('No results found');
   return items;
