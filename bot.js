@@ -72,154 +72,165 @@ function searchButtons(index, total) {
   );
 }
 
-// ── yt-dlp helpers ────────────────────────────────────────────────────────────
-// Place a cookies.txt file (exported from your browser while logged into YouTube)
-// in the same folder as this bot file to fix YouTube bot-detection errors.
-const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
-const COOKIES_EXIST = fs.existsSync(COOKIES_PATH);
-const COOKIES_ARG = COOKIES_EXIST ? ['--cookies', COOKIES_PATH] : [];
+// ── Invidious API (no cookies, no bot detection, no auth needed) ──────────────
+// Invidious is an open-source YouTube frontend with a public API.
+// We auto-pick the healthiest available instance.
 
-// Used for downloads/streaming — includes rate-limit delay
-const YTDLP_ARGS = [
-  '--no-playlist',
-  '--extractor-args', 'youtube:player_client=android',
-  '--sleep-requests', '1',
-  ...COOKIES_ARG,
+const INVIDIOUS_FALLBACKS = [
+  'invidious.privacydev.net',
+  'inv.nadeko.net',
+  'yewtu.be',
+  'yt.cdaut.de',
 ];
+let _invInstance = null;
 
-// Used for metadata (search, info) — no delay needed
-const YTDLP_META_ARGS = [
-  '--no-playlist',
-  '--extractor-args', 'youtube:player_client=android',
-  ...COOKIES_ARG,
-];
+function extractVideoId(url) {
+  const m = url.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
+  return m?.[1] ?? null;
+}
 
-// Run yt-dlp and return stdout as a string
-function ytdlpRun(args) {
+function invGet(hostname, reqPath) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('yt-dlp', args);
-    let out = '', err = '';
-    proc.stdout.on('data', d => out += d);
-    proc.stderr.on('data', d => err += d);
-    proc.on('close', code => code === 0 ? resolve(out) : reject(new Error(err.trim() || `yt-dlp exited ${code}`)));
-  });
-}
-
-// Search YouTube — returns array of result objects shaped like play-dl results
-async function ytSearch(query, limit = 10) {
-  const out = await ytdlpRun([
-    `ytsearch${limit}:${query}`,
-    '--dump-json', '--flat-playlist', '--quiet', '--no-warnings',
-    ...YTDLP_META_ARGS,
-  ]);
-  return out.trim().split('\n').filter(Boolean).map(line => {
-    const v = JSON.parse(line);
-    return {
-      title:       v.title ?? 'Unknown',
-      url:         v.url?.startsWith('http') ? v.url : `https://www.youtube.com/watch?v=${v.id}`,
-      durationInSec: v.duration ?? 0,
-      views:       v.view_count ?? 0,
-      channel:     { name: v.channel || v.uploader || 'Unknown' },
-      thumbnails:  [{ url: v.thumbnail || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg` }],
-    };
-  });
-}
-
-// Fetch metadata for a single video URL
-async function ytInfo(url) {
-  const out = await ytdlpRun([
-    url, '--dump-json', '--quiet', '--no-warnings', ...YTDLP_META_ARGS,
-  ]);
-  const v = JSON.parse(out.trim());
-  return {
-    title:     v.title ?? 'Unknown',
-    url:       `https://www.youtube.com/watch?v=${v.id}`,
-    duration:  v.duration ?? 0,   // track objects use 'duration'
-    author:    v.channel || v.uploader || 'Unknown',
-    thumbnail: v.thumbnail || null,
-  };
-}
-
-async function getAudioResource(url) {
-  const ytdlpProc = spawn('yt-dlp', ['-f', 'bestaudio', '-o', '-', '--quiet', ...YTDLP_ARGS, url]);
-  const ffmpegProc = spawn('ffmpeg', ['-i', 'pipe:0', '-vn', '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'], {
-    stdio: ['pipe', 'pipe', 'ignore'],
-  });
-  ytdlpProc.stdout.pipe(ffmpegProc.stdin);
-  ytdlpProc.stderr.on('data', d => console.error('yt-dlp:', d.toString()));
-  return createAudioResource(ffmpegProc.stdout, { inputType: StreamType.Raw });
-}
-
-// ── Cobalt downloader — auto-selects a working public instance ────────────────
-let _cobaltHost = null;
-
-async function getCobaltHost() {
-  if (_cobaltHost) return _cobaltHost;
-  return new Promise((resolve, reject) => {
-    https.get({
-      hostname: 'instances.cobalt.best',
-      path: '/instances.json',
-      headers: { 'User-Agent': 'discord-ytbot/1.0' },
-    }, res => {
+    https.get({ hostname, path: reqPath, headers: { 'User-Agent': 'discord-ytbot/1.0' } }, res => {
       let out = '';
       res.on('data', d => out += d);
-      res.on('end', () => {
-        try {
-          const list = JSON.parse(out).flat();
-          const pick = list
-            .filter(i => i.online?.api === true && i.cors === true && i.services?.youtube === true && i.score >= 50)
-            .sort((a, b) => b.score - a.score)[0];
-          if (!pick) return reject(new Error('No working cobalt instance found'));
-          _cobaltHost = pick.api;
-          console.log(`[cobalt] using instance: ${_cobaltHost}`);
-          resolve(_cobaltHost);
-        } catch { reject(new Error('Failed to parse cobalt instance list')); }
-      });
+      res.on('end', () => { try { resolve(JSON.parse(out)); } catch { reject(new Error('Invalid JSON from ' + hostname)); } });
     }).on('error', reject);
   });
 }
 
-function cobaltGetUrl(videoUrl, opts = {}) {
-  return getCobaltHost().then(host => new Promise((resolve, reject) => {
-    const body = Buffer.from(JSON.stringify({ url: videoUrl, filenameStyle: 'basic', ...opts }));
-    const req = https.request({
-      hostname: host,
-      path: '/',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Content-Length': body.length,
-      },
-    }, res => {
-      let out = '';
-      res.on('data', d => out += d);
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(out);
-          if (data.status === 'error') {
-            _cobaltHost = null; // reset so next attempt tries a fresh instance
-            return reject(new Error(data.error?.code ?? 'Cobalt error'));
-          }
-          if (!data.url) return reject(new Error('No download URL returned'));
-          resolve(data.url);
-        } catch { reject(new Error('Invalid response from cobalt instance')); }
-      });
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
+async function getInvidiousInstance() {
+  if (_invInstance) return _invInstance;
+  // Try the official instance health list first
+  try {
+    const list = await invGet('api.invidious.io', '/instances.json?sort_by=health');
+    const good = list.find(([, i]) => i.type === 'https' && i.api === true && (i.health_status?.score ?? 0) >= 80);
+    if (good) { _invInstance = good[0]; console.log(`[invidious] ${_invInstance}`); return _invInstance; }
+  } catch {}
+  // Try hardcoded fallbacks
+  for (const host of INVIDIOUS_FALLBACKS) {
+    try {
+      await invGet(host, '/api/v1/stats');
+      _invInstance = host; console.log(`[invidious] fallback: ${_invInstance}`); return _invInstance;
+    } catch {}
+  }
+  throw new Error('No Invidious instance reachable — try again later');
+}
+
+async function invVideoInfo(videoId) {
+  const instance = await getInvidiousInstance();
+  const data = await invGet(instance, `/api/v1/videos/${videoId}`);
+  if (data.error) { _invInstance = null; throw new Error(data.error); }
+  return { instance, data };
+}
+
+// Search YouTube via Invidious
+async function ytSearch(query, limit = 10) {
+  const instance = await getInvidiousInstance();
+  const results = await invGet(instance, `/api/v1/search?q=${encodeURIComponent(query)}&type=video`);
+  if (!Array.isArray(results)) throw new Error('Search failed');
+  return results.slice(0, limit).map(v => ({
+    title:        v.title ?? 'Unknown',
+    url:          `https://www.youtube.com/watch?v=${v.videoId}`,
+    durationInSec: v.lengthSeconds ?? 0,
+    views:        v.viewCount ?? 0,
+    channel:      { name: v.author ?? 'Unknown' },
+    thumbnails:   v.videoThumbnails?.length ? v.videoThumbnails : [{ url: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg` }],
   }));
 }
 
+// Fetch single video metadata via Invidious
+async function ytInfo(url) {
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const { data } = await invVideoInfo(videoId);
+  return {
+    title:     data.title ?? 'Unknown',
+    url:       `https://www.youtube.com/watch?v=${data.videoId}`,
+    duration:  data.lengthSeconds ?? 0,
+    author:    data.author ?? 'Unknown',
+    thumbnail: data.videoThumbnails?.[0]?.url ?? null,
+  };
+}
+
+// Get best audio stream URL from Invidious video info
+function bestAudioUrl(data) {
+  const streams = (data.adaptiveFormats ?? []).filter(f => f.type?.startsWith('audio/') && f.url);
+  if (streams.length) return streams.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0].url;
+  return data.formatStreams?.[0]?.url ?? null;
+}
+
+async function getAudioResource(url) {
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const { data } = await invVideoInfo(videoId);
+  const audioUrl = bestAudioUrl(data);
+  if (!audioUrl) throw new Error('No audio stream found');
+  const ffmpegProc = spawn('ffmpeg', [
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-i', audioUrl, '-vn', '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1',
+  ], { stdio: ['ignore', 'pipe', 'ignore'] });
+  return createAudioResource(ffmpegProc.stdout, { inputType: StreamType.Raw });
+}
+
 async function downloadMp4(url, outputPath) {
-  const dlUrl = await cobaltGetUrl(url, { videoQuality: '720' });
-  await streamToFile(dlUrl, outputPath);
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const { data } = await invVideoInfo(videoId);
+
+  const videoStream = (data.adaptiveFormats ?? [])
+    .filter(f => f.type?.startsWith('video/mp4') && f.url && parseInt(f.resolution) <= 720)
+    .sort((a, b) => parseInt(b.resolution) - parseInt(a.resolution))[0];
+  const audioStream = (data.adaptiveFormats ?? [])
+    .filter(f => f.type?.startsWith('audio/') && f.url)
+    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+
+  if (videoStream && audioStream) {
+    const tmpV = outputPath + '_v.mp4', tmpA = outputPath + '_a.m4a';
+    try {
+      await streamToFile(videoStream.url, tmpV);
+      await streamToFile(audioStream.url, tmpA);
+      await execAsync(`ffmpeg -i "${tmpV}" -i "${tmpA}" -c copy "${outputPath}" -y`);
+    } finally {
+      [tmpV, tmpA].forEach(f => { try { fs.unlinkSync(f); } catch {} });
+    }
+    return;
+  }
+  // Fallback: combined format stream
+  const combined = (data.formatStreams ?? []).find(f => f.container === 'mp4' && f.url);
+  if (!combined) throw new Error('No suitable video format found');
+  await streamToFile(combined.url, outputPath);
 }
 
 async function downloadMp3(url, outputPath) {
-  const dlUrl = await cobaltGetUrl(url, { downloadMode: 'audio', audioFormat: 'mp3', audioBitrate: '192' });
-  await streamToFile(dlUrl, outputPath);
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const { data } = await invVideoInfo(videoId);
+  const audioUrl = bestAudioUrl(data);
+  if (!audioUrl) throw new Error('No audio stream found');
+  const tmp = outputPath + '_tmp';
+  try {
+    await streamToFile(audioUrl, tmp);
+    await execAsync(`ffmpeg -i "${tmp}" -vn -ar 44100 -ac 2 -b:a 192k "${outputPath}" -y`);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+function streamToFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const proto = url.startsWith('https') ? https : http;
+    const file = fs.createWriteStream(dest);
+    proto.get(url, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        file.close(); fs.unlink(dest, () => {});
+        return streamToFile(res.headers.location, dest).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) { file.close(); return reject(new Error(`HTTP ${res.statusCode}`)); }
+      res.pipe(file);
+      file.on('finish', () => { file.close(); resolve(); });
+    }).on('error', err => { fs.unlink(dest, () => {}); reject(err); });
+  });
 }
 
 // ── Guild state ───────────────────────────────────────────────────────────────
@@ -614,12 +625,6 @@ client.on(Events.MessageCreate, async (message) => {
 
 client.once(Events.ClientReady, () => {
   console.log(`✅ Online as ${client.user.tag}`);
-  if (!COOKIES_EXIST) {
-    console.warn('⚠️  cookies.txt not found — YouTube downloads may fail with bot-detection errors.');
-    console.warn('   Export cookies from your browser at youtube.com and place cookies.txt next to bot.js');
-  } else {
-    console.log('🍪 cookies.txt loaded');
-  }
   client.user.setActivity('bren is cool', { type: 2 });
 });
 
