@@ -72,98 +72,115 @@ function searchButtons(index, total) {
   );
 }
 
-// ── Piped API (no cookies, no bot detection, no auth needed) ────────────────
-// Piped is an open-source YouTube proxy with a reliable public API.
-const PIPED_INSTANCES = [
-  'pipedapi.kavin.rocks',
-  'api.piped.yt',
-  'pipedapi.moomoo.me',
-  'piped-api.lunar.icu',
-  'pipedapi.libre.datura.nl',
-];
-let _pipedHost = null;
+// ── YouTube InnerTube API (direct, no third-party services) ─────────────────
+// This is the same internal API yt-dlp uses, called directly from Node.js.
+// Android client context returns pre-signed stream URLs — no cipher decoding needed.
+
+const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+const ANDROID_CTX = {
+  client: {
+    clientName: 'ANDROID', clientVersion: '17.31.35',
+    androidSdkVersion: 30, hl: 'en', gl: 'US',
+    userAgent: 'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
+  },
+};
 
 function extractVideoId(url) {
   const m = url.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
   return m?.[1] ?? null;
 }
 
-function pipedGet(hostname, reqPath) {
+function innertubePost(endpoint, body) {
   return new Promise((resolve, reject) => {
-    const req = https.get({
-      hostname, path: reqPath,
-      headers: { 'User-Agent': 'discord-ytbot/1.0', 'Accept': 'application/json' },
-      timeout: 8000,
+    const payload = Buffer.from(JSON.stringify(body));
+    const req = https.request({
+      hostname: 'www.youtube.com',
+      path: '/youtubei/v1/' + endpoint + '?key=' + INNERTUBE_KEY + '&prettyPrint=false',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': payload.length,
+        'User-Agent': 'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
+        'X-YouTube-Client-Name': '3',
+        'X-YouTube-Client-Version': '17.31.35',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      timeout: 12000,
     }, res => {
       let out = '';
       res.on('data', d => out += d);
       res.on('end', () => {
         try { resolve(JSON.parse(out)); }
-        catch { reject(new Error('Non-JSON from ' + hostname)); }
+        catch { reject(new Error('Bad InnerTube response: ' + out.slice(0, 80))); }
       });
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout: ' + hostname)); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('InnerTube timed out')); });
+    req.write(payload);
+    req.end();
   });
 }
 
-async function pipedGetAny(reqPath) {
-  const queue = _pipedHost
-    ? [_pipedHost, ...PIPED_INSTANCES.filter(h => h !== _pipedHost)]
-    : [...PIPED_INSTANCES];
-  for (const host of queue) {
-    try {
-      const data = await pipedGet(host, reqPath);
-      if (data.error) throw new Error(data.error);
-      _pipedHost = host;
-      return data;
-    } catch (e) {
-      console.warn('[piped] ' + host + ' failed: ' + e.message);
-      if (_pipedHost === host) _pipedHost = null;
-    }
-  }
-  throw new Error('All Piped instances failed — try again later');
+async function getPlayerData(videoId) {
+  const data = await innertubePost('player', { videoId, context: ANDROID_CTX });
+  const status = data?.playabilityStatus?.status;
+  if (status !== 'OK') throw new Error(data?.playabilityStatus?.reason ?? 'Video unavailable (' + status + ')');
+  return data;
+}
+
+function parseDurText(t) {
+  if (!t) return 0;
+  return t.split(':').map(Number).reverse().reduce((s, v, i) => s + v * Math.pow(60, i), 0);
 }
 
 async function ytSearch(query, limit = 10) {
-  const data = await pipedGetAny('/search?q=' + encodeURIComponent(query) + '&filter=videos');
-  const items = data.items ?? [];
-  return items.filter(v => v.type === 'stream').slice(0, limit).map(v => {
-    const videoId = (v.url ?? '').replace('/watch?v=', '');
-    return {
-      title:         v.title ?? 'Unknown',
-      url:           'https://www.youtube.com/watch?v=' + videoId,
-      durationInSec: v.duration ?? 0,
-      views:         v.views ?? 0,
-      channel:       { name: v.uploaderName ?? 'Unknown' },
-      thumbnails:    [{ url: v.thumbnail ?? ('https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg') }],
-    };
-  });
+  const data = await innertubePost('search', { query, params: 'EgIQAQ==', context: ANDROID_CTX });
+  const items = [];
+  for (const section of (data?.contents?.sectionListRenderer?.contents ?? [])) {
+    for (const item of (section?.itemSectionRenderer?.contents ?? [])) {
+      const v = item?.videoRenderer ?? item?.compactVideoRenderer;
+      if (!v?.videoId) continue;
+      items.push({
+        title:         v.title?.runs?.[0]?.text ?? v.title?.simpleText ?? 'Unknown',
+        url:           'https://www.youtube.com/watch?v=' + v.videoId,
+        durationInSec: parseDurText(v.lengthText?.simpleText),
+        views:         parseInt((v.viewCountText?.simpleText ?? '').replace(/[^0-9]/g, '')) || 0,
+        channel:       { name: v.ownerText?.runs?.[0]?.text ?? v.shortBylineText?.runs?.[0]?.text ?? 'Unknown' },
+        thumbnails:    [{ url: 'https://i.ytimg.com/vi/' + v.videoId + '/hqdefault.jpg' }],
+      });
+      if (items.length >= limit) break;
+    }
+    if (items.length >= limit) break;
+  }
+  if (!items.length) throw new Error('No results found');
+  return items;
 }
 
 async function ytInfo(url) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await pipedGetAny('/streams/' + videoId);
+  const data = await getPlayerData(videoId);
+  const d = data.videoDetails;
   return {
-    title:     data.title ?? 'Unknown',
+    title:     d?.title ?? 'Unknown',
     url:       'https://www.youtube.com/watch?v=' + videoId,
-    duration:  data.duration ?? 0,
-    author:    data.uploader ?? 'Unknown',
-    thumbnail: data.thumbnailUrl ?? null,
+    duration:  parseInt(d?.lengthSeconds) || 0,
+    author:    d?.author ?? 'Unknown',
+    thumbnail: d?.thumbnail?.thumbnails?.slice(-1)?.[0]?.url ?? null,
   };
 }
 
-function bestPipedAudio(data) {
-  const streams = (data.audioStreams ?? []).filter(s => s.url);
-  return streams.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0]?.url ?? null;
+function bestAudioStream(data) {
+  return (data.streamingData?.adaptiveFormats ?? [])
+    .filter(f => f.mimeType?.startsWith('audio/') && f.url)
+    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0]?.url ?? null;
 }
 
 async function getAudioResource(url) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await pipedGetAny('/streams/' + videoId);
-  const audioUrl = bestPipedAudio(data);
+  const data = await getPlayerData(videoId);
+  const audioUrl = bestAudioStream(data);
   if (!audioUrl) throw new Error('No audio stream found');
   const ffmpegProc = spawn('ffmpeg', [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
@@ -175,13 +192,14 @@ async function getAudioResource(url) {
 async function downloadMp4(url, outputPath) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await pipedGetAny('/streams/' + videoId);
+  const data = await getPlayerData(videoId);
+  const adaptive = data.streamingData?.adaptiveFormats ?? [];
 
-  const videoStream = (data.videoStreams ?? [])
-    .filter(s => s.videoOnly && s.url && parseInt(s.quality) <= 720)
-    .sort((a, b) => parseInt(b.quality) - parseInt(a.quality))[0];
-  const audioStream = (data.audioStreams ?? [])
-    .filter(s => s.url)
+  const videoStream = adaptive
+    .filter(f => f.mimeType?.startsWith('video/mp4') && f.url && (f.height ?? 999) <= 720)
+    .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))[0];
+  const audioStream = adaptive
+    .filter(f => f.mimeType?.startsWith('audio/') && f.url)
     .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
 
   if (videoStream && audioStream) {
@@ -195,8 +213,7 @@ async function downloadMp4(url, outputPath) {
     }
     return;
   }
-  // Fallback: non-video-only stream
-  const combined = (data.videoStreams ?? []).find(s => !s.videoOnly && s.url);
+  const combined = (data.streamingData?.formats ?? []).find(f => f.mimeType?.startsWith('video/mp4') && f.url);
   if (!combined) throw new Error('No suitable video format found');
   await streamToFile(combined.url, outputPath);
 }
@@ -204,8 +221,8 @@ async function downloadMp4(url, outputPath) {
 async function downloadMp3(url, outputPath) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await pipedGetAny('/streams/' + videoId);
-  const audioUrl = bestPipedAudio(data);
+  const data = await getPlayerData(videoId);
+  const audioUrl = bestAudioStream(data);
   if (!audioUrl) throw new Error('No audio stream found');
   const tmp = outputPath + '_tmp';
   try {
