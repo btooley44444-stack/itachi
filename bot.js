@@ -133,25 +133,30 @@ function parseDurText(t) {
   return t.split(':').map(Number).reverse().reduce((s, v, i) => s + v * Math.pow(60, i), 0);
 }
 
+function findVideos(obj, found = []) {
+  if (!obj || typeof obj !== 'object') return found;
+  const v = obj.videoRenderer ?? obj.compactVideoRenderer;
+  if (v?.videoId) {
+    found.push({
+      title:         v.title?.runs?.[0]?.text ?? v.title?.simpleText ?? 'Unknown',
+      url:           'https://www.youtube.com/watch?v=' + v.videoId,
+      durationInSec: parseDurText(v.lengthText?.simpleText),
+      views:         parseInt((v.viewCountText?.simpleText ?? '').replace(/[^0-9]/g, '')) || 0,
+      channel:       { name: v.ownerText?.runs?.[0]?.text ?? v.shortBylineText?.runs?.[0]?.text ?? 'Unknown' },
+      thumbnails:    [{ url: 'https://i.ytimg.com/vi/' + v.videoId + '/hqdefault.jpg' }],
+    });
+  } else {
+    for (const val of Object.values(obj)) {
+      if (Array.isArray(val)) val.forEach(i => findVideos(i, found));
+      else if (val && typeof val === 'object') findVideos(val, found);
+    }
+  }
+  return found;
+}
+
 async function ytSearch(query, limit = 10) {
   const data = await innertubePost('search', { query, params: 'EgIQAQ==', context: ANDROID_CTX });
-  const items = [];
-  for (const section of (data?.contents?.sectionListRenderer?.contents ?? [])) {
-    for (const item of (section?.itemSectionRenderer?.contents ?? [])) {
-      const v = item?.videoRenderer ?? item?.compactVideoRenderer;
-      if (!v?.videoId) continue;
-      items.push({
-        title:         v.title?.runs?.[0]?.text ?? v.title?.simpleText ?? 'Unknown',
-        url:           'https://www.youtube.com/watch?v=' + v.videoId,
-        durationInSec: parseDurText(v.lengthText?.simpleText),
-        views:         parseInt((v.viewCountText?.simpleText ?? '').replace(/[^0-9]/g, '')) || 0,
-        channel:       { name: v.ownerText?.runs?.[0]?.text ?? v.shortBylineText?.runs?.[0]?.text ?? 'Unknown' },
-        thumbnails:    [{ url: 'https://i.ytimg.com/vi/' + v.videoId + '/hqdefault.jpg' }],
-      });
-      if (items.length >= limit) break;
-    }
-    if (items.length >= limit) break;
-  }
+  const items = findVideos(data).slice(0, limit);
   if (!items.length) throw new Error('No results found');
   return items;
 }
