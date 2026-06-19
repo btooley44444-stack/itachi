@@ -72,214 +72,98 @@ function searchButtons(index, total) {
   );
 }
 
-// ── YouTube InnerTube API (direct, no third-party services) ─────────────────
-let _ytKey = null;
-let _ytVer = null;
-
-async function getYtConfig() {
-  if (_ytKey) return { key: _ytKey, ver: _ytVer };
-  return new Promise(resolve => {
-    const fallback = () => {
-      _ytKey = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-      _ytVer = '2.20240101.09.00';
-      resolve({ key: _ytKey, ver: _ytVer });
-    };
-    const req = https.get({
-      hostname: 'www.youtube.com',
-      path: '/',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      timeout: 10000,
-    }, res => {
-      let html = '';
-      res.on('data', d => { html += d; if (html.length > 120000) req.destroy(); });
-      res.on('end', () => {
-        const k = (html.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [])[1];
-        const v = (html.match(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/) || [])[1];
-        _ytKey = k || 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-        _ytVer = v || '2.20240101.09.00';
-        console.log('[yt] config: key=' + _ytKey.slice(0, 16) + '... ver=' + _ytVer);
-        resolve({ key: _ytKey, ver: _ytVer });
-      });
-    });
-    req.on('error', fallback);
-    req.on('timeout', () => { req.destroy(); fallback(); });
-  });
-}
-
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function extractVideoId(url) {
   const m = url.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
   return m?.[1] ?? null;
 }
 
-async function innertubePost(endpoint, body) {
-  const { key, ver } = await getYtConfig();
+// ── yt-dlp (search, info, streaming) ─────────────────────────────────────────
+const YTDLP_BASE = ['--no-playlist', '--extractor-args', 'youtube:player_client=android', '--no-warnings', '--quiet'];
+
+function ytdlpRun(args, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
-    const payload = Buffer.from(JSON.stringify(body));
+    const proc = spawn('yt-dlp', args);
+    let out = '', err = '';
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error('yt-dlp timed out')); }, timeoutMs);
+    proc.stdout.on('data', d => out += d);
+    proc.stderr.on('data', d => err += d);
+    proc.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0) resolve(out);
+      else reject(new Error(err.trim().split('\n').filter(l => l.startsWith('ERROR')).pop() || err.trim().split('\n').pop() || 'yt-dlp failed'));
+    });
+  });
+}
+
+async function ytSearch(query, limit = 10) {
+  const out = await ytdlpRun([`ytsearch${limit}:${query}`, '--dump-json', '--flat-playlist', ...YTDLP_BASE]);
+  return out.trim().split('\n').filter(Boolean).map(line => {
+    const v = JSON.parse(line);
+    return {
+      title:         v.title ?? 'Unknown',
+      url:           `https://www.youtube.com/watch?v=${v.id}`,
+      durationInSec: v.duration ?? 0,
+      views:         v.view_count ?? 0,
+      channel:       { name: v.channel || v.uploader || 'Unknown' },
+      thumbnails:    [{ url: v.thumbnail || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg` }],
+    };
+  });
+}
+
+async function ytInfo(url) {
+  const out = await ytdlpRun([url, '--dump-json', ...YTDLP_BASE]);
+  const v = JSON.parse(out.trim());
+  return {
+    title:     v.title ?? 'Unknown',
+    url:       `https://www.youtube.com/watch?v=${v.id}`,
+    duration:  v.duration ?? 0,
+    author:    v.channel || v.uploader || 'Unknown',
+    thumbnail: v.thumbnail || null,
+  };
+}
+
+async function getAudioResource(url) {
+  const proc = spawn('yt-dlp', ['-f', 'bestaudio', '-o', '-', ...YTDLP_BASE, url]);
+  const ffmpeg = spawn('ffmpeg', ['-i', 'pipe:0', '-vn', '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
+  proc.stdout.pipe(ffmpeg.stdin);
+  proc.stderr.on('data', d => { const s = d.toString(); if (s.includes('ERROR')) console.error('yt-dlp:', s.trim()); });
+  return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+}
+
+// ── Downloads via InnerTube TV-embedded client (no cookies needed) ────────────
+// TV client returns direct stream URLs without signature cipher
+async function getTvStreams(videoId) {
+  return new Promise((resolve, reject) => {
+    const body = Buffer.from(JSON.stringify({
+      videoId,
+      context: {
+        client: { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', hl: 'en', gl: 'US' },
+        thirdParty: { embedUrl: 'https://www.youtube.com' },
+      },
+    }));
     const req = https.request({
       hostname: 'www.youtube.com',
-      path: '/youtubei/v1/' + endpoint + '?key=' + key + '&prettyPrint=false',
+      path: '/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': payload.length,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'X-YouTube-Client-Name': '1',
-        'X-YouTube-Client-Version': ver,
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://www.youtube.com',
-        'Referer': 'https://www.youtube.com/',
-      },
-      timeout: 12000,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': body.length, 'User-Agent': 'Mozilla/5.0', 'X-YouTube-Client-Name': '85', 'X-YouTube-Client-Version': '2.0' },
+      timeout: 15000,
     }, res => {
       let out = '';
       res.on('data', d => out += d);
       res.on('end', () => {
-        try { resolve(JSON.parse(out)); }
-        catch { reject(new Error('Bad InnerTube response: ' + out.slice(0, 120))); }
+        try {
+          const data = JSON.parse(out);
+          if (data?.playabilityStatus?.status !== 'OK') reject(new Error(data?.playabilityStatus?.reason ?? 'Video unavailable'));
+          else resolve(data);
+        } catch { reject(new Error('Bad player response')); }
       });
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('InnerTube timed out')); });
-    req.write(payload);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Player request timed out')); });
+    req.write(body);
     req.end();
   });
-}
-
-async function getPlayerData(videoId) {
-  const { ver } = await getYtConfig();
-  const body = {
-    videoId,
-    context: {
-      client: {
-        clientName: 'WEB',
-        clientVersion: ver,
-        hl: 'en',
-        gl: 'US',
-      },
-    },
-  };
-  const data = await innertubePost('player', body);
-  const status = data?.playabilityStatus?.status;
-  if (status !== 'OK') throw new Error(data?.playabilityStatus?.reason ?? 'Video unavailable (' + status + ')');
-  return data;
-}
-
-function parseDurText(t) {
-  if (!t) return 0;
-  return t.split(':').map(Number).reverse().reduce((s, v, i) => s + v * Math.pow(60, i), 0);
-}
-
-function findVideos(obj, found = []) {
-  if (!obj || typeof obj !== 'object') return found;
-  const v = obj.videoRenderer ?? obj.compactVideoRenderer;
-  if (v?.videoId) {
-    found.push({
-      title:         v.title?.runs?.[0]?.text ?? v.title?.simpleText ?? 'Unknown',
-      url:           'https://www.youtube.com/watch?v=' + v.videoId,
-      durationInSec: parseDurText(v.lengthText?.simpleText),
-      views:         parseInt((v.viewCountText?.simpleText ?? '').replace(/[^0-9]/g, '')) || 0,
-      channel:       { name: v.ownerText?.runs?.[0]?.text ?? v.shortBylineText?.runs?.[0]?.text ?? 'Unknown' },
-      thumbnails:    [{ url: 'https://i.ytimg.com/vi/' + v.videoId + '/hqdefault.jpg' }],
-    });
-  } else {
-    for (const val of Object.values(obj)) {
-      if (Array.isArray(val)) val.forEach(i => findVideos(i, found));
-      else if (val && typeof val === 'object') findVideos(val, found);
-    }
-  }
-  return found;
-}
-
-async function ytSearch(query, limit = 10) {
-  const { ver } = await getYtConfig();
-  const data = await innertubePost('search', {
-    query,
-    params: 'EgIQAQ==',
-    context: { client: { clientName: 'WEB', clientVersion: ver, hl: 'en', gl: 'US' } },
-  });
-  const items = findVideos(data).slice(0, limit);
-  if (!items.length) throw new Error('No results found');
-  return items;
-}
-
-async function ytInfo(url) {
-  const videoId = extractVideoId(url);
-  if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await getPlayerData(videoId);
-  const d = data.videoDetails;
-  return {
-    title:     d?.title ?? 'Unknown',
-    url:       'https://www.youtube.com/watch?v=' + videoId,
-    duration:  parseInt(d?.lengthSeconds) || 0,
-    author:    d?.author ?? 'Unknown',
-    thumbnail: d?.thumbnail?.thumbnails?.slice(-1)?.[0]?.url ?? null,
-  };
-}
-
-function bestAudioStream(data) {
-  return (data.streamingData?.adaptiveFormats ?? [])
-    .filter(f => f.mimeType?.startsWith('audio/') && f.url)
-    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0]?.url ?? null;
-}
-
-async function getAudioResource(url) {
-  const videoId = extractVideoId(url);
-  if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await getPlayerData(videoId);
-  const audioUrl = bestAudioStream(data);
-  if (!audioUrl) throw new Error('No audio stream found');
-  const ffmpegProc = spawn('ffmpeg', [
-    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    '-i', audioUrl, '-vn', '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1',
-  ], { stdio: ['ignore', 'pipe', 'ignore'] });
-  return createAudioResource(ffmpegProc.stdout, { inputType: StreamType.Raw });
-}
-
-async function downloadMp4(url, outputPath) {
-  const videoId = extractVideoId(url);
-  if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await getPlayerData(videoId);
-  const adaptive = data.streamingData?.adaptiveFormats ?? [];
-
-  const videoStream = adaptive
-    .filter(f => f.mimeType?.startsWith('video/mp4') && f.url && (f.height ?? 999) <= 720)
-    .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))[0];
-  const audioStream = adaptive
-    .filter(f => f.mimeType?.startsWith('audio/') && f.url)
-    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
-
-  if (videoStream && audioStream) {
-    const tmpV = outputPath + '_v.mp4', tmpA = outputPath + '_a.m4a';
-    try {
-      await streamToFile(videoStream.url, tmpV);
-      await streamToFile(audioStream.url, tmpA);
-      await execAsync('ffmpeg -i "' + tmpV + '" -i "' + tmpA + '" -c copy "' + outputPath + '" -y');
-    } finally {
-      [tmpV, tmpA].forEach(f => { try { fs.unlinkSync(f); } catch {} });
-    }
-    return;
-  }
-  const combined = (data.streamingData?.formats ?? []).find(f => f.mimeType?.startsWith('video/mp4') && f.url);
-  if (!combined) throw new Error('No suitable video format found');
-  await streamToFile(combined.url, outputPath);
-}
-
-async function downloadMp3(url, outputPath) {
-  const videoId = extractVideoId(url);
-  if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await getPlayerData(videoId);
-  const audioUrl = bestAudioStream(data);
-  if (!audioUrl) throw new Error('No audio stream found');
-  const tmp = outputPath + '_tmp';
-  try {
-    await streamToFile(audioUrl, tmp);
-    await execAsync('ffmpeg -i "' + tmp + '" -vn -ar 44100 -ac 2 -b:a 192k "' + outputPath + '" -y');
-  } finally {
-    try { fs.unlinkSync(tmp); } catch {}
-  }
 }
 
 function streamToFile(url, dest) {
@@ -291,12 +175,57 @@ function streamToFile(url, dest) {
         file.close(); fs.unlink(dest, () => {});
         return streamToFile(res.headers.location, dest).then(resolve).catch(reject);
       }
-      if (res.statusCode !== 200) { file.close(); return reject(new Error('HTTP ' + res.statusCode)); }
+      if (res.statusCode !== 200) { file.close(); return reject(new Error(`HTTP ${res.statusCode}`)); }
       res.pipe(file);
       file.on('finish', () => { file.close(); resolve(); });
     }).on('error', err => { fs.unlink(dest, () => {}); reject(err); });
   });
 }
+
+async function downloadMp4(url, outputPath) {
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const data = await getTvStreams(videoId);
+  const formats = data.streamingData?.adaptiveFormats ?? [];
+  const combined = data.streamingData?.formats ?? [];
+
+  const videoStream = formats
+    .filter(f => f.mimeType?.startsWith('video/mp4') && f.url && (f.height ?? 999) <= 720)
+    .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))[0];
+  const audioStream = formats
+    .filter(f => f.mimeType?.startsWith('audio/') && f.url)
+    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+
+  if (videoStream?.url && audioStream?.url) {
+    const tmpV = outputPath + '_v.mp4', tmpA = outputPath + '_a.m4a';
+    try {
+      await streamToFile(videoStream.url, tmpV);
+      await streamToFile(audioStream.url, tmpA);
+      await execAsync(`ffmpeg -i "${tmpV}" -i "${tmpA}" -c copy "${outputPath}" -y`);
+    } finally { [tmpV, tmpA].forEach(f => { try { fs.unlinkSync(f); } catch {} }); }
+    return;
+  }
+  const fallback = combined.find(f => f.mimeType?.startsWith('video/mp4') && f.url);
+  if (!fallback) throw new Error('No video stream found. Try .play to stream instead.');
+  await streamToFile(fallback.url, outputPath);
+}
+
+async function downloadMp3(url, outputPath) {
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const data = await getTvStreams(videoId);
+  const audioUrl = (data.streamingData?.adaptiveFormats ?? [])
+    .filter(f => f.mimeType?.startsWith('audio/') && f.url)
+    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0]?.url
+    ?? (data.streamingData?.formats ?? []).find(f => f.url)?.url;
+  if (!audioUrl) throw new Error('No audio stream found');
+  const tmp = outputPath + '_tmp';
+  try {
+    await streamToFile(audioUrl, tmp);
+    await execAsync(`ffmpeg -i "${tmp}" -vn -ar 44100 -ac 2 -b:a 192k "${outputPath}" -y`);
+  } finally { try { fs.unlinkSync(tmp); } catch {} }
+}
+
 
 // ── Guild state ───────────────────────────────────────────────────────────────
 function getGuild(guildId) {
