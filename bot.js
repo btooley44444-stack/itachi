@@ -72,26 +72,29 @@ function searchButtons(index, total) {
   );
 }
 
-// ── Invidious API (no cookies, no bot detection, no auth needed) ──────────────
-const INVIDIOUS_FALLBACKS = [
-  'invidious.privacydev.net',
-  'inv.nadeko.net',
-  'invidious.fdn.fr',
-  'iv.ggtyler.dev',
-  'invidious.nerdvpn.de',
-  'yewtu.be',
-  'yt.cdaut.de',
+// ── Piped API (no cookies, no bot detection, no auth needed) ────────────────
+// Piped is an open-source YouTube proxy with a reliable public API.
+const PIPED_INSTANCES = [
+  'pipedapi.kavin.rocks',
+  'api.piped.yt',
+  'pipedapi.moomoo.me',
+  'piped-api.lunar.icu',
+  'pipedapi.libre.datura.nl',
 ];
-let _invInstance = null;
+let _pipedHost = null;
 
 function extractVideoId(url) {
   const m = url.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
   return m?.[1] ?? null;
 }
 
-function invGet(hostname, reqPath) {
+function pipedGet(hostname, reqPath) {
   return new Promise((resolve, reject) => {
-    const req = https.get({ hostname, path: reqPath, headers: { 'User-Agent': 'discord-ytbot/1.0' }, timeout: 8000 }, res => {
+    const req = https.get({
+      hostname, path: reqPath,
+      headers: { 'User-Agent': 'discord-ytbot/1.0', 'Accept': 'application/json' },
+      timeout: 8000,
+    }, res => {
       let out = '';
       res.on('data', d => out += d);
       res.on('end', () => {
@@ -104,62 +107,63 @@ function invGet(hostname, reqPath) {
   });
 }
 
-// Try every fallback instance until one succeeds
-async function invGetAny(reqPath) {
-  const queue = _invInstance
-    ? [_invInstance, ...INVIDIOUS_FALLBACKS.filter(h => h !== _invInstance)]
-    : [...INVIDIOUS_FALLBACKS];
+async function pipedGetAny(reqPath) {
+  const queue = _pipedHost
+    ? [_pipedHost, ...PIPED_INSTANCES.filter(h => h !== _pipedHost)]
+    : [...PIPED_INSTANCES];
   for (const host of queue) {
     try {
-      const data = await invGet(host, reqPath);
+      const data = await pipedGet(host, reqPath);
       if (data.error) throw new Error(data.error);
-      _invInstance = host;
+      _pipedHost = host;
       return data;
     } catch (e) {
-      console.warn('[invidious] ' + host + ' failed: ' + e.message);
-      if (_invInstance === host) _invInstance = null;
+      console.warn('[piped] ' + host + ' failed: ' + e.message);
+      if (_pipedHost === host) _pipedHost = null;
     }
   }
-  throw new Error('All Invidious instances failed — try again later');
+  throw new Error('All Piped instances failed — try again later');
 }
 
 async function ytSearch(query, limit = 10) {
-  const results = await invGetAny('/api/v1/search?q=' + encodeURIComponent(query) + '&type=video');
-  if (!Array.isArray(results)) throw new Error('Unexpected search response');
-  return results.slice(0, limit).map(v => ({
-    title:         v.title ?? 'Unknown',
-    url:           'https://www.youtube.com/watch?v=' + v.videoId,
-    durationInSec: v.lengthSeconds ?? 0,
-    views:         v.viewCount ?? 0,
-    channel:       { name: v.author ?? 'Unknown' },
-    thumbnails:    v.videoThumbnails?.length ? v.videoThumbnails : [{ url: 'https://i.ytimg.com/vi/' + v.videoId + '/hqdefault.jpg' }],
-  }));
+  const data = await pipedGetAny('/search?q=' + encodeURIComponent(query) + '&filter=videos');
+  const items = data.items ?? [];
+  return items.filter(v => v.type === 'stream').slice(0, limit).map(v => {
+    const videoId = (v.url ?? '').replace('/watch?v=', '');
+    return {
+      title:         v.title ?? 'Unknown',
+      url:           'https://www.youtube.com/watch?v=' + videoId,
+      durationInSec: v.duration ?? 0,
+      views:         v.views ?? 0,
+      channel:       { name: v.uploaderName ?? 'Unknown' },
+      thumbnails:    [{ url: v.thumbnail ?? ('https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg') }],
+    };
+  });
 }
 
 async function ytInfo(url) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await invGetAny('/api/v1/videos/' + videoId);
+  const data = await pipedGetAny('/streams/' + videoId);
   return {
     title:     data.title ?? 'Unknown',
-    url:       'https://www.youtube.com/watch?v=' + data.videoId,
-    duration:  data.lengthSeconds ?? 0,
-    author:    data.author ?? 'Unknown',
-    thumbnail: data.videoThumbnails?.[0]?.url ?? null,
+    url:       'https://www.youtube.com/watch?v=' + videoId,
+    duration:  data.duration ?? 0,
+    author:    data.uploader ?? 'Unknown',
+    thumbnail: data.thumbnailUrl ?? null,
   };
 }
 
-function bestAudioUrl(data) {
-  const streams = (data.adaptiveFormats ?? []).filter(f => f.type?.startsWith('audio/') && f.url);
-  if (streams.length) return streams.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0].url;
-  return data.formatStreams?.[0]?.url ?? null;
+function bestPipedAudio(data) {
+  const streams = (data.audioStreams ?? []).filter(s => s.url);
+  return streams.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0]?.url ?? null;
 }
 
 async function getAudioResource(url) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await invGetAny('/api/v1/videos/' + videoId);
-  const audioUrl = bestAudioUrl(data);
+  const data = await pipedGetAny('/streams/' + videoId);
+  const audioUrl = bestPipedAudio(data);
   if (!audioUrl) throw new Error('No audio stream found');
   const ffmpegProc = spawn('ffmpeg', [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
@@ -171,13 +175,15 @@ async function getAudioResource(url) {
 async function downloadMp4(url, outputPath) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await invGetAny('/api/v1/videos/' + videoId);
-  const videoStream = (data.adaptiveFormats ?? [])
-    .filter(f => f.type?.startsWith('video/mp4') && f.url && parseInt(f.resolution) <= 720)
-    .sort((a, b) => parseInt(b.resolution) - parseInt(a.resolution))[0];
-  const audioStream = (data.adaptiveFormats ?? [])
-    .filter(f => f.type?.startsWith('audio/') && f.url)
+  const data = await pipedGetAny('/streams/' + videoId);
+
+  const videoStream = (data.videoStreams ?? [])
+    .filter(s => s.videoOnly && s.url && parseInt(s.quality) <= 720)
+    .sort((a, b) => parseInt(b.quality) - parseInt(a.quality))[0];
+  const audioStream = (data.audioStreams ?? [])
+    .filter(s => s.url)
     .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+
   if (videoStream && audioStream) {
     const tmpV = outputPath + '_v.mp4', tmpA = outputPath + '_a.m4a';
     try {
@@ -189,7 +195,8 @@ async function downloadMp4(url, outputPath) {
     }
     return;
   }
-  const combined = (data.formatStreams ?? []).find(f => f.container === 'mp4' && f.url);
+  // Fallback: non-video-only stream
+  const combined = (data.videoStreams ?? []).find(s => !s.videoOnly && s.url);
   if (!combined) throw new Error('No suitable video format found');
   await streamToFile(combined.url, outputPath);
 }
@@ -197,8 +204,8 @@ async function downloadMp4(url, outputPath) {
 async function downloadMp3(url, outputPath) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await invGetAny('/api/v1/videos/' + videoId);
-  const audioUrl = bestAudioUrl(data);
+  const data = await pipedGetAny('/streams/' + videoId);
+  const audioUrl = bestPipedAudio(data);
   if (!audioUrl) throw new Error('No audio stream found');
   const tmp = outputPath + '_tmp';
   try {
