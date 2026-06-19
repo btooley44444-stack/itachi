@@ -73,37 +73,64 @@ function searchButtons(index, total) {
 }
 
 // ── YouTube InnerTube API (direct, no third-party services) ─────────────────
-// This is the same internal API yt-dlp uses, called directly from Node.js.
-// Android client context returns pre-signed stream URLs — no cipher decoding needed.
+let _ytKey = null;
+let _ytVer = null;
 
-const INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-const ANDROID_CTX = {
-  client: {
-    clientName: 'ANDROID', clientVersion: '17.31.35',
-    androidSdkVersion: 30, hl: 'en', gl: 'US',
-    userAgent: 'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
-  },
-};
+async function getYtConfig() {
+  if (_ytKey) return { key: _ytKey, ver: _ytVer };
+  return new Promise(resolve => {
+    const fallback = () => {
+      _ytKey = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+      _ytVer = '2.20240101.09.00';
+      resolve({ key: _ytKey, ver: _ytVer });
+    };
+    const req = https.get({
+      hostname: 'www.youtube.com',
+      path: '/',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      timeout: 10000,
+    }, res => {
+      let html = '';
+      res.on('data', d => { html += d; if (html.length > 120000) req.destroy(); });
+      res.on('end', () => {
+        const k = (html.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [])[1];
+        const v = (html.match(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/) || [])[1];
+        _ytKey = k || 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+        _ytVer = v || '2.20240101.09.00';
+        console.log('[yt] config: key=' + _ytKey.slice(0, 16) + '... ver=' + _ytVer);
+        resolve({ key: _ytKey, ver: _ytVer });
+      });
+    });
+    req.on('error', fallback);
+    req.on('timeout', () => { req.destroy(); fallback(); });
+  });
+}
 
 function extractVideoId(url) {
   const m = url.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
   return m?.[1] ?? null;
 }
 
-function innertubePost(endpoint, body) {
+async function innertubePost(endpoint, body) {
+  const { key, ver } = await getYtConfig();
   return new Promise((resolve, reject) => {
     const payload = Buffer.from(JSON.stringify(body));
     const req = https.request({
       hostname: 'www.youtube.com',
-      path: '/youtubei/v1/' + endpoint + '?key=' + INNERTUBE_KEY + '&prettyPrint=false',
+      path: '/youtubei/v1/' + endpoint + '?key=' + key + '&prettyPrint=false',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': payload.length,
-        'User-Agent': 'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
-        'X-YouTube-Client-Name': '3',
-        'X-YouTube-Client-Version': '17.31.35',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'X-YouTube-Client-Name': '1',
+        'X-YouTube-Client-Version': ver,
         'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://www.youtube.com',
+        'Referer': 'https://www.youtube.com/',
       },
       timeout: 12000,
     }, res => {
@@ -111,7 +138,7 @@ function innertubePost(endpoint, body) {
       res.on('data', d => out += d);
       res.on('end', () => {
         try { resolve(JSON.parse(out)); }
-        catch { reject(new Error('Bad InnerTube response: ' + out.slice(0, 80))); }
+        catch { reject(new Error('Bad InnerTube response: ' + out.slice(0, 120))); }
       });
     });
     req.on('error', reject);
@@ -122,7 +149,19 @@ function innertubePost(endpoint, body) {
 }
 
 async function getPlayerData(videoId) {
-  const data = await innertubePost('player', { videoId, context: ANDROID_CTX });
+  const { ver } = await getYtConfig();
+  const body = {
+    videoId,
+    context: {
+      client: {
+        clientName: 'WEB',
+        clientVersion: ver,
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+  };
+  const data = await innertubePost('player', body);
   const status = data?.playabilityStatus?.status;
   if (status !== 'OK') throw new Error(data?.playabilityStatus?.reason ?? 'Video unavailable (' + status + ')');
   return data;
@@ -155,8 +194,12 @@ function findVideos(obj, found = []) {
 }
 
 async function ytSearch(query, limit = 10) {
-  const data = await innertubePost('search', { query, params: 'EgIQAQ==', context: ANDROID_CTX });
-  console.log('[search raw]', JSON.stringify(data).slice(0, 500));
+  const { ver } = await getYtConfig();
+  const data = await innertubePost('search', {
+    query,
+    params: 'EgIQAQ==',
+    context: { client: { clientName: 'WEB', clientVersion: ver, hl: 'en', gl: 'US' } },
+  });
   const items = findVideos(data).slice(0, limit);
   if (!items.length) throw new Error('No results found');
   return items;
