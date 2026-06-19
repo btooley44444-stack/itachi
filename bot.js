@@ -73,12 +73,12 @@ function searchButtons(index, total) {
 }
 
 // ── Invidious API (no cookies, no bot detection, no auth needed) ──────────────
-// Invidious is an open-source YouTube frontend with a public API.
-// We auto-pick the healthiest available instance.
-
 const INVIDIOUS_FALLBACKS = [
   'invidious.privacydev.net',
   'inv.nadeko.net',
+  'invidious.fdn.fr',
+  'iv.ggtyler.dev',
+  'invidious.nerdvpn.de',
   'yewtu.be',
   'yt.cdaut.de',
 ];
@@ -91,69 +91,64 @@ function extractVideoId(url) {
 
 function invGet(hostname, reqPath) {
   return new Promise((resolve, reject) => {
-    https.get({ hostname, path: reqPath, headers: { 'User-Agent': 'discord-ytbot/1.0' } }, res => {
+    const req = https.get({ hostname, path: reqPath, headers: { 'User-Agent': 'discord-ytbot/1.0' }, timeout: 8000 }, res => {
       let out = '';
       res.on('data', d => out += d);
-      res.on('end', () => { try { resolve(JSON.parse(out)); } catch { reject(new Error('Invalid JSON from ' + hostname)); } });
-    }).on('error', reject);
+      res.on('end', () => {
+        try { resolve(JSON.parse(out)); }
+        catch { reject(new Error('Non-JSON from ' + hostname)); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout: ' + hostname)); });
   });
 }
 
-async function getInvidiousInstance() {
-  if (_invInstance) return _invInstance;
-  // Try the official instance health list first
-  try {
-    const list = await invGet('api.invidious.io', '/instances.json?sort_by=health');
-    const good = list.find(([, i]) => i.type === 'https' && i.api === true && (i.health_status?.score ?? 0) >= 80);
-    if (good) { _invInstance = good[0]; console.log(`[invidious] ${_invInstance}`); return _invInstance; }
-  } catch {}
-  // Try hardcoded fallbacks
-  for (const host of INVIDIOUS_FALLBACKS) {
+// Try every fallback instance until one succeeds
+async function invGetAny(reqPath) {
+  const queue = _invInstance
+    ? [_invInstance, ...INVIDIOUS_FALLBACKS.filter(h => h !== _invInstance)]
+    : [...INVIDIOUS_FALLBACKS];
+  for (const host of queue) {
     try {
-      await invGet(host, '/api/v1/stats');
-      _invInstance = host; console.log(`[invidious] fallback: ${_invInstance}`); return _invInstance;
-    } catch {}
+      const data = await invGet(host, reqPath);
+      if (data.error) throw new Error(data.error);
+      _invInstance = host;
+      return data;
+    } catch (e) {
+      console.warn('[invidious] ' + host + ' failed: ' + e.message);
+      if (_invInstance === host) _invInstance = null;
+    }
   }
-  throw new Error('No Invidious instance reachable — try again later');
+  throw new Error('All Invidious instances failed — try again later');
 }
 
-async function invVideoInfo(videoId) {
-  const instance = await getInvidiousInstance();
-  const data = await invGet(instance, `/api/v1/videos/${videoId}`);
-  if (data.error) { _invInstance = null; throw new Error(data.error); }
-  return { instance, data };
-}
-
-// Search YouTube via Invidious
 async function ytSearch(query, limit = 10) {
-  const instance = await getInvidiousInstance();
-  const results = await invGet(instance, `/api/v1/search?q=${encodeURIComponent(query)}&type=video`);
-  if (!Array.isArray(results)) throw new Error('Search failed');
+  const results = await invGetAny('/api/v1/search?q=' + encodeURIComponent(query) + '&type=video');
+  if (!Array.isArray(results)) throw new Error('Unexpected search response');
   return results.slice(0, limit).map(v => ({
-    title:        v.title ?? 'Unknown',
-    url:          `https://www.youtube.com/watch?v=${v.videoId}`,
+    title:         v.title ?? 'Unknown',
+    url:           'https://www.youtube.com/watch?v=' + v.videoId,
     durationInSec: v.lengthSeconds ?? 0,
-    views:        v.viewCount ?? 0,
-    channel:      { name: v.author ?? 'Unknown' },
-    thumbnails:   v.videoThumbnails?.length ? v.videoThumbnails : [{ url: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg` }],
+    views:         v.viewCount ?? 0,
+    channel:       { name: v.author ?? 'Unknown' },
+    thumbnails:    v.videoThumbnails?.length ? v.videoThumbnails : [{ url: 'https://i.ytimg.com/vi/' + v.videoId + '/hqdefault.jpg' }],
   }));
 }
 
-// Fetch single video metadata via Invidious
 async function ytInfo(url) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const { data } = await invVideoInfo(videoId);
+  const data = await invGetAny('/api/v1/videos/' + videoId);
   return {
     title:     data.title ?? 'Unknown',
-    url:       `https://www.youtube.com/watch?v=${data.videoId}`,
+    url:       'https://www.youtube.com/watch?v=' + data.videoId,
     duration:  data.lengthSeconds ?? 0,
     author:    data.author ?? 'Unknown',
     thumbnail: data.videoThumbnails?.[0]?.url ?? null,
   };
 }
 
-// Get best audio stream URL from Invidious video info
 function bestAudioUrl(data) {
   const streams = (data.adaptiveFormats ?? []).filter(f => f.type?.startsWith('audio/') && f.url);
   if (streams.length) return streams.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0].url;
@@ -163,7 +158,7 @@ function bestAudioUrl(data) {
 async function getAudioResource(url) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const { data } = await invVideoInfo(videoId);
+  const data = await invGetAny('/api/v1/videos/' + videoId);
   const audioUrl = bestAudioUrl(data);
   if (!audioUrl) throw new Error('No audio stream found');
   const ffmpegProc = spawn('ffmpeg', [
@@ -176,27 +171,24 @@ async function getAudioResource(url) {
 async function downloadMp4(url, outputPath) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const { data } = await invVideoInfo(videoId);
-
+  const data = await invGetAny('/api/v1/videos/' + videoId);
   const videoStream = (data.adaptiveFormats ?? [])
     .filter(f => f.type?.startsWith('video/mp4') && f.url && parseInt(f.resolution) <= 720)
     .sort((a, b) => parseInt(b.resolution) - parseInt(a.resolution))[0];
   const audioStream = (data.adaptiveFormats ?? [])
     .filter(f => f.type?.startsWith('audio/') && f.url)
     .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
-
   if (videoStream && audioStream) {
     const tmpV = outputPath + '_v.mp4', tmpA = outputPath + '_a.m4a';
     try {
       await streamToFile(videoStream.url, tmpV);
       await streamToFile(audioStream.url, tmpA);
-      await execAsync(`ffmpeg -i "${tmpV}" -i "${tmpA}" -c copy "${outputPath}" -y`);
+      await execAsync('ffmpeg -i "' + tmpV + '" -i "' + tmpA + '" -c copy "' + outputPath + '" -y');
     } finally {
       [tmpV, tmpA].forEach(f => { try { fs.unlinkSync(f); } catch {} });
     }
     return;
   }
-  // Fallback: combined format stream
   const combined = (data.formatStreams ?? []).find(f => f.container === 'mp4' && f.url);
   if (!combined) throw new Error('No suitable video format found');
   await streamToFile(combined.url, outputPath);
@@ -205,13 +197,13 @@ async function downloadMp4(url, outputPath) {
 async function downloadMp3(url, outputPath) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
-  const { data } = await invVideoInfo(videoId);
+  const data = await invGetAny('/api/v1/videos/' + videoId);
   const audioUrl = bestAudioUrl(data);
   if (!audioUrl) throw new Error('No audio stream found');
   const tmp = outputPath + '_tmp';
   try {
     await streamToFile(audioUrl, tmp);
-    await execAsync(`ffmpeg -i "${tmp}" -vn -ar 44100 -ac 2 -b:a 192k "${outputPath}" -y`);
+    await execAsync('ffmpeg -i "' + tmp + '" -vn -ar 44100 -ac 2 -b:a 192k "' + outputPath + '" -y');
   } finally {
     try { fs.unlinkSync(tmp); } catch {}
   }
@@ -226,7 +218,7 @@ function streamToFile(url, dest) {
         file.close(); fs.unlink(dest, () => {});
         return streamToFile(res.headers.location, dest).then(resolve).catch(reject);
       }
-      if (res.statusCode !== 200) { file.close(); return reject(new Error(`HTTP ${res.statusCode}`)); }
+      if (res.statusCode !== 200) { file.close(); return reject(new Error('HTTP ' + res.statusCode)); }
       res.pipe(file);
       file.on('finish', () => { file.close(); resolve(); });
     }).on('error', err => { fs.unlink(dest, () => {}); reject(err); });
