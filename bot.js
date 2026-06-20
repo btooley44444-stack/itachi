@@ -35,6 +35,10 @@ function extractVideoId(url) {
   return m?.[1] ?? null;
 }
 
+function isTikTokUrl(url) {
+  return /tiktok\.com/i.test(url);
+}
+
 function fmtDuration(sec) {
   if (!sec) return 'Live';
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
@@ -98,15 +102,18 @@ function findChromiumPath() {
   return null;
 }
 
-async function phptoolsGetPublicUrl(videoUrl, onProgress) {
+async function launchBrowser() {
   const execPath = findChromiumPath();
   if (!execPath) throw new Error('Chromium is not installed in this container — check the Dockerfile');
-
-  const browser = await puppeteer.launch({
+  return puppeteer.launch({
     executablePath: execPath,
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   });
+}
+
+async function phptoolsGetPublicUrl(videoUrl, onProgress) {
+  const browser = await launchBrowser();
 
   try {
     const page = await browser.newPage();
@@ -161,7 +168,76 @@ async function phptoolsGetPublicUrl(videoUrl, onProgress) {
   }
 }
 
+// ── TikTok downloader via snaptik.app (same browser-automation approach) ──────
+async function tiktokGetDownloadUrl(videoUrl) {
+  const browser = await launchBrowser();
+
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
+    await page.goto('https://snaptik.app/en', { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    const inputSelector = await page.evaluate(() => {
+      const candidates = ['#url', 'input[name="url"]', 'input[type="text"]'];
+      for (const sel of candidates) { if (document.querySelector(sel)) return sel; }
+      return null;
+    });
+    if (!inputSelector) throw new Error('Could not find the URL input field on snaptik.app');
+
+    await page.click(inputSelector, { clickCount: 3 }).catch(() => {});
+    await page.type(inputSelector, videoUrl, { delay: 10 });
+
+    try {
+      await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+        const btn = btns.find(b => /download/i.test(b.textContent || b.value || ''));
+        if (btn) btn.click();
+      });
+    } catch (e) {
+      if (!/context was destroyed|navigation/i.test(e.message)) throw e;
+    }
+
+    // snaptik.app loads results via AJAX (no full page navigation expected),
+    // so wait for a result link to show up in the DOM.
+    await page.waitForFunction(() => {
+      return Array.from(document.querySelectorAll('a')).some(a =>
+        a.href?.startsWith('http') && (/\.mp4(\?|$)/i.test(a.href) || /download/i.test(a.textContent))
+      );
+    }, { timeout: 30000 }).catch(() => {});
+
+    const dlUrl = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a'))
+        .map(a => ({ href: a.href, text: (a.textContent || '').trim() }))
+        .filter(a => a.href && a.href.startsWith('http'));
+      const noWatermark = links.find(l => /without watermark/i.test(l.text));
+      if (noWatermark) return noWatermark.href;
+      const mp4 = links.find(l => /\.mp4(\?|$)/i.test(l.href));
+      if (mp4) return mp4.href;
+      const dl = links.find(l => /download/i.test(l.text));
+      return dl ? dl.href : null;
+    });
+
+    if (!dlUrl) {
+      const debugText = await page.evaluate(() => document.body.innerText).catch(() => '');
+      console.error('[tiktok] no download link found, page text:', debugText.slice(0, 500));
+      throw new Error('Could not find a download link on snaptik.app');
+    }
+    return dlUrl;
+  } finally {
+    await browser.close();
+  }
+}
+
 async function ytInfo(url) {
+  if (isTikTokUrl(url)) {
+    return {
+      title:     'TikTok Video',
+      url,
+      duration:  0,
+      author:    'Unknown',
+      thumbnail: null,
+    };
+  }
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
   return {
@@ -174,15 +250,19 @@ async function ytInfo(url) {
 }
 
 async function downloadMp4(url, outputPath, onProgress) {
-  const publicUrl = await phptoolsGetPublicUrl(url, onProgress);
-  await streamToFile(publicUrl, outputPath);
+  const dlUrl = isTikTokUrl(url)
+    ? await tiktokGetDownloadUrl(url)
+    : await phptoolsGetPublicUrl(url, onProgress);
+  await streamToFile(dlUrl, outputPath);
 }
 
 async function downloadMp3(url, outputPath, onProgress) {
-  const publicUrl = await phptoolsGetPublicUrl(url, onProgress);
+  const dlUrl = isTikTokUrl(url)
+    ? await tiktokGetDownloadUrl(url)
+    : await phptoolsGetPublicUrl(url, onProgress);
   const tmp = outputPath + '_tmp.mp4';
   try {
-    await streamToFile(publicUrl, tmp);
+    await streamToFile(dlUrl, tmp);
     await execAsync(`ffmpeg -i "${tmp}" -vn -ar 44100 -ac 2 -b:a 192k "${outputPath}" -y`);
   } finally {
     try { fs.unlinkSync(tmp); } catch {}
@@ -190,10 +270,12 @@ async function downloadMp3(url, outputPath, onProgress) {
 }
 
 async function getAudioResource(url) {
-  const publicUrl = await phptoolsGetPublicUrl(url);
+  const dlUrl = isTikTokUrl(url)
+    ? await tiktokGetDownloadUrl(url)
+    : await phptoolsGetPublicUrl(url);
   const ffmpeg = spawn('ffmpeg', [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    '-i', publicUrl, '-vn', '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1',
+    '-i', dlUrl, '-vn', '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'ignore'] });
   return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
 }
@@ -322,7 +404,7 @@ async function ensureVoice(message, state) {
 
 // ── Resolve a track from URL or search query ──────────────────────────────────
 async function resolveTrack(query) {
-  if (query.includes('youtube.com') || query.includes('youtu.be')) {
+  if (query.includes('youtube.com') || query.includes('youtu.be') || isTikTokUrl(query)) {
     return ytInfo(query);
   }
   const results = await ytSearch(query, 1);
