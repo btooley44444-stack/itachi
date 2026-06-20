@@ -116,41 +116,45 @@ async function phptoolsGetPublicUrl(videoUrl, onProgress) {
     await page.waitForSelector('input[name="yt_url"]', { timeout: 15000 });
     await page.type('input[name="yt_url"]', videoUrl, { delay: 10 });
 
-    if (onProgress) onProgress('🔄 Submitting to the downloader site...');
+    // Click the main "Download" button. This can trigger a page navigation,
+    // which destroys the current JS execution context — that's expected, so
+    // we swallow that specific error rather than letting it bubble up.
+    try {
+      await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        const btn = btns.find(b => b.textContent.trim().toLowerCase() === 'download');
+        if (btn) btn.click();
+      });
+    } catch (e) {
+      if (!/context was destroyed|navigation/i.test(e.message)) throw e;
+    }
 
-    // Click the main "Download" button (not "Download Now" or "Clean Up Videos")
-    const clicked = await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button'));
-      const btn = btns.find(b => b.textContent.trim().toLowerCase() === 'download');
-      if (btn) { btn.click(); return true; }
-      return false;
-    });
-    if (!clicked) throw new Error('Could not find the Download button on phptools.org — the site may have changed');
-
-    if (onProgress) onProgress('⏳ Processing on phptools.org (usually 30–90s)...');
+    // Give any navigation triggered by the click a moment to settle.
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
 
     const maxWaitMs = 150000;
     const start = Date.now();
     let publicUrl = null;
-    let lastNotify = 0;
 
     while (Date.now() - start < maxWaitMs) {
-      const text = await page.evaluate(() => document.body.innerText);
+      let text = null;
+      try {
+        text = await page.evaluate(() => document.body.innerText);
+      } catch {
+        // Page navigated again mid-read — just retry next loop iteration.
+        await new Promise(r => setTimeout(r, 1500));
+        continue;
+      }
       const m = text.match(/"public_url"\s*:\s*"([^"]+)"/);
       if (m) { publicUrl = m[1]; break; }
       if (/error/i.test(text) && !/Too many stored videos/i.test(text)) {
         const errMatch = text.match(/"error"\s*:\s*"([^"]+)"/);
-        if (errMatch) throw new Error('phptools.org: ' + errMatch[1]);
-      }
-      const elapsed = Math.round((Date.now() - start) / 1000);
-      if (onProgress && elapsed - lastNotify >= 20) {
-        lastNotify = elapsed;
-        onProgress(`⏳ Still processing on phptools.org (${elapsed}s elapsed)...`);
+        if (errMatch) throw new Error(errMatch[1]);
       }
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    if (!publicUrl) throw new Error('Timed out waiting for phptools.org to finish processing');
+    if (!publicUrl) throw new Error('Timed out waiting for the download to finish processing');
     return publicUrl.startsWith('http') ? publicUrl : ('https://phptools.org' + publicUrl);
   } finally {
     await browser.close();
@@ -171,13 +175,11 @@ async function ytInfo(url) {
 
 async function downloadMp4(url, outputPath, onProgress) {
   const publicUrl = await phptoolsGetPublicUrl(url, onProgress);
-  if (onProgress) onProgress('📥 Downloading file...');
   await streamToFile(publicUrl, outputPath);
 }
 
 async function downloadMp3(url, outputPath, onProgress) {
   const publicUrl = await phptoolsGetPublicUrl(url, onProgress);
-  if (onProgress) onProgress('📥 Downloading and converting to mp3...');
   const tmp = outputPath + '_tmp.mp4';
   try {
     await streamToFile(publicUrl, tmp);
