@@ -205,23 +205,33 @@ async function tiktokGetDownloadUrl(videoUrl) {
       );
     }, { timeout: 30000 }).catch(() => {});
 
-    const dlUrl = await page.evaluate(() => {
-      const links = Array.from(document.querySelectorAll('a'))
-        .map(a => ({ href: a.href, text: (a.textContent || '').trim() }))
+    const candidates = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('a'))
+        .map(a => ({
+          href: a.href,
+          text: (a.textContent || '').trim(),
+          cls: a.className || '',
+        }))
         .filter(a => a.href && a.href.startsWith('http'));
-      const noWatermark = links.find(l => /without watermark/i.test(l.text));
-      if (noWatermark) return noWatermark.href;
-      const mp4 = links.find(l => /\.mp4(\?|$)/i.test(l.href));
-      if (mp4) return mp4.href;
-      const dl = links.find(l => /download/i.test(l.text));
-      return dl ? dl.href : null;
     });
+    console.log('[tiktok] candidate links:', JSON.stringify(candidates).slice(0, 1500));
+
+    const isJunk = l => /thumb|cover|preview|poster|avatar|icon|logo/i.test(l.href) || /thumb|cover|preview|poster/i.test(l.text);
+
+    let dlUrl =
+      candidates.find(l => !isJunk(l) && /without watermark|no watermark/i.test(l.text))?.href ??
+      candidates.find(l => !isJunk(l) && /download/i.test(l.text) && /hd|high quality/i.test(l.text))?.href ??
+      candidates.find(l => !isJunk(l) && /download/i.test(l.text) && /\.mp4(\?|$)/i.test(l.href))?.href ??
+      candidates.find(l => !isJunk(l) && /download/i.test(l.text))?.href ??
+      candidates.find(l => !isJunk(l) && /\.mp4(\?|$)/i.test(l.href))?.href ??
+      null;
 
     if (!dlUrl) {
       const debugText = await page.evaluate(() => document.body.innerText).catch(() => '');
       console.error('[tiktok] no download link found, page text:', debugText.slice(0, 500));
       throw new Error('Could not find a download link on snaptik.app');
     }
+    console.log('[tiktok] selected link:', dlUrl.slice(0, 200));
     return dlUrl;
   } finally {
     await browser.close();
@@ -254,6 +264,8 @@ async function downloadMp4(url, outputPath, onProgress) {
     ? await tiktokGetDownloadUrl(url)
     : await phptoolsGetPublicUrl(url, onProgress);
   await streamToFile(dlUrl, outputPath);
+  const sizeKB = fs.statSync(outputPath).size / 1024;
+  console.log(`[download] saved ${sizeKB.toFixed(0)} KB from ${dlUrl.slice(0, 80)}`);
 }
 
 async function downloadMp3(url, outputPath, onProgress) {
