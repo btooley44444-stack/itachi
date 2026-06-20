@@ -34,6 +34,50 @@ function extractVideoId(url) {
   return m?.[1] ?? null;
 }
 
+function fmtDuration(sec) {
+  if (!sec) return 'Live';
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+  return h
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function fmtViews(n) {
+  if (!n) return 'Unknown';
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return n.toString();
+}
+
+function sanitize(name) {
+  return name.replace(/[/\\?%*:|"<>]/g, '-').trim();
+}
+
+function searchEmbed(results, index) {
+  const r = results[index];
+  return new EmbedBuilder()
+    .setTitle(r.title)
+    .setURL(r.url)
+    .setColor(0xff0000)
+    .setThumbnail(r.thumbnails?.[r.thumbnails.length - 1]?.url ?? null)
+    .addFields(
+      { name: 'Channel',  value: r.channel?.name ?? 'Unknown', inline: true },
+      { name: 'Duration', value: fmtDuration(r.durationInSec),  inline: true },
+      { name: 'Views',    value: fmtViews(r.views),              inline: true },
+    )
+    .setFooter({ text: `Result ${index + 1} of ${results.length} • .dl to download • .play to stream` });
+}
+
+function searchButtons(index, total) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('prev')    .setLabel('◀ Prev')      .setStyle(ButtonStyle.Secondary).setDisabled(index === 0),
+    new ButtonBuilder().setCustomId('next')    .setLabel('Next ▶')      .setStyle(ButtonStyle.Secondary).setDisabled(index === total - 1),
+    new ButtonBuilder().setCustomId('download').setLabel('⬇ Download')  .setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('playBtn') .setLabel('▶ Play')      .setStyle(ButtonStyle.Primary),
+  );
+}
+
+
 // ── RapidAPI: YouTube Video FAST Downloader 24/7 ───────────────────────────────
 // Set RAPIDAPI_KEY in Railway env vars to override this default.
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || '308fc51e14msh11adec4cafaddd6p14b30cjsnc576a17c3b6b';
