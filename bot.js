@@ -125,13 +125,36 @@ function deepFind(obj, keyPattern, typeCheck = () => true) {
 }
 
 function extractDownloadUrl(data) {
-  return deepFind(data, /url|link/i, v => typeof v === 'string' && v.startsWith('http'));
+  // This API returns the link under a "file" key, not "url"/"link"
+  return deepFind(data, /^file$|url|link/i, v => typeof v === 'string' && v.startsWith('http'));
 }
 function extractTitle(data) {
   return deepFind(data, /title/i, v => typeof v === 'string' && v.length > 0) ?? 'Unknown';
 }
 function extractDuration(data) {
   return deepFind(data, /duration|length/i, v => typeof v === 'number') ?? 0;
+}
+
+// The API processes files async — the returned URL 404s for 20-300s until ready.
+// Poll with HEAD requests until it's available (or give up after maxWaitMs).
+function waitUntilReady(url, maxWaitMs = 240000, intervalMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = () => {
+      const req = https.request(url, { method: 'HEAD', timeout: 8000 }, res => {
+        if (res.statusCode === 200) return resolve();
+        if (Date.now() - start > maxWaitMs) return reject(new Error('File never became ready (timed out waiting)'));
+        setTimeout(check, intervalMs);
+      });
+      req.on('error', () => {
+        if (Date.now() - start > maxWaitMs) return reject(new Error('File never became ready (timed out waiting)'));
+        setTimeout(check, intervalMs);
+      });
+      req.on('timeout', () => { req.destroy(); setTimeout(check, intervalMs); });
+      req.end();
+    };
+    check();
+  });
 }
 
 async function ytInfo(url) {
@@ -147,7 +170,7 @@ async function ytInfo(url) {
   };
 }
 
-async function downloadMp4(url, outputPath) {
+async function downloadMp4(url, outputPath, onProgress) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
   const data = await rapidApiGet(`/download_video/${videoId}?quality=18`); // itag 18 = 360p mp4, muxed video+audio
@@ -156,10 +179,12 @@ async function downloadMp4(url, outputPath) {
     console.error('[rapidapi] video response:', JSON.stringify(data).slice(0, 400));
     throw new Error('Downloader API did not return a video link');
   }
+  if (onProgress) onProgress('⏳ Video is processing on the server (usually 20–120s)...');
+  await waitUntilReady(dlUrl);
   await streamToFile(dlUrl, outputPath);
 }
 
-async function downloadMp3(url, outputPath) {
+async function downloadMp3(url, outputPath, onProgress) {
   const videoId = extractVideoId(url);
   if (!videoId) throw new Error('Invalid YouTube URL');
   const data = await rapidApiGet(`/download_audio/${videoId}?quality=251`); // itag 251 = opus audio
@@ -168,6 +193,8 @@ async function downloadMp3(url, outputPath) {
     console.error('[rapidapi] audio response:', JSON.stringify(data).slice(0, 400));
     throw new Error('Downloader API did not return an audio link');
   }
+  if (onProgress) onProgress('⏳ Audio is processing on the server (usually 20–120s)...');
+  await waitUntilReady(dlUrl);
   const tmp = outputPath + '_tmp';
   try {
     await streamToFile(dlUrl, tmp);
@@ -183,6 +210,7 @@ async function getAudioResource(url) {
   const data = await rapidApiGet(`/download_audio/${videoId}?quality=251`);
   const dlUrl = extractDownloadUrl(data);
   if (!dlUrl) throw new Error('Downloader API did not return an audio link');
+  await waitUntilReady(dlUrl);
   const ffmpeg = spawn('ffmpeg', [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-i', dlUrl, '-vn', '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1',
@@ -334,7 +362,7 @@ async function handleDownload(track, replyFn, sendFileFn) {
     fs.mkdirSync(tmpDir, { recursive: true });
     const outputPath = path.join(tmpDir, `${sanitize(track.title)}.mp4`);
     await replyFn(`⏬ Downloading **${track.title}**...`);
-    await downloadMp4(track.url, outputPath);
+    await downloadMp4(track.url, outputPath, msg => replyFn(msg));
     const sizeMB = fs.statSync(outputPath).size / (1024 * 1024);
     if (sizeMB > 25) {
       await replyFn(`❌ File is ${sizeMB.toFixed(1)} MB — too large for Discord. Try \`.play\` to stream it.`);
@@ -425,7 +453,7 @@ commands.mp3 = async (message, args) => {
     fs.mkdirSync(tmpDir, { recursive: true });
     const outputPath = path.join(tmpDir, `${sanitize(v.title)}.mp3`);
     await status.edit(`⏬ Downloading audio for **${v.title}**...`);
-    await downloadMp3(url, outputPath);
+    await downloadMp3(url, outputPath, msg => status.edit(msg).catch(() => {}));
     const sizeMB = fs.statSync(outputPath).size / (1024 * 1024);
     if (sizeMB > 25) return status.edit(`❌ File is ${sizeMB.toFixed(1)} MB — too large.`);
     await status.edit(`✅ Sending **${v.title}** (${sizeMB.toFixed(1)} MB)...`);
