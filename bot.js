@@ -29,141 +29,121 @@ const guilds = new Map();
 const searchSessions = new Map(); // userId → { results, index }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function fmtDuration(sec) {
-  if (!sec) return 'Live';
-  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-  return h
-    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-    : `${m}:${String(s).padStart(2, '0')}`;
-}
-
-function fmtViews(n) {
-  if (!n) return 'Unknown';
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return n.toString();
-}
-
-function sanitize(name) {
-  return name.replace(/[/\\?%*:|"<>]/g, '-').trim();
-}
-
-function searchEmbed(results, index) {
-  const r = results[index];
-  return new EmbedBuilder()
-    .setTitle(r.title)
-    .setURL(r.url)
-    .setColor(0xff0000)
-    .setThumbnail(r.thumbnails?.[r.thumbnails.length - 1]?.url ?? null)
-    .addFields(
-      { name: 'Channel',  value: r.channel?.name ?? 'Unknown', inline: true },
-      { name: 'Duration', value: fmtDuration(r.durationInSec),  inline: true },
-      { name: 'Views',    value: fmtViews(r.views),              inline: true },
-    )
-    .setFooter({ text: `Result ${index + 1} of ${results.length} • .dl to download • .play to stream` });
-}
-
-function searchButtons(index, total) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('prev')    .setLabel('◀ Prev')      .setStyle(ButtonStyle.Secondary).setDisabled(index === 0),
-    new ButtonBuilder().setCustomId('next')    .setLabel('Next ▶')      .setStyle(ButtonStyle.Secondary).setDisabled(index === total - 1),
-    new ButtonBuilder().setCustomId('download').setLabel('⬇ Download')  .setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('playBtn') .setLabel('▶ Play')      .setStyle(ButtonStyle.Primary),
-  );
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 function extractVideoId(url) {
   const m = url.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
   return m?.[1] ?? null;
 }
 
-// ── yt-dlp (search, info, streaming) ─────────────────────────────────────────
-const YTDLP_BASE = ['--no-playlist', '--extractor-args', 'youtube:player_client=android', '--no-warnings', '--quiet'];
+// ── RapidAPI: YouTube Video FAST Downloader 24/7 ───────────────────────────────
+// Set RAPIDAPI_KEY in Railway env vars to override this default.
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || '308fc51e14msh11adec4cafaddd6p14b30cjsnc576a17c3b6b';
+const RAPIDAPI_HOST = 'youtube-video-fast-downloader-24-7.p.rapidapi.com';
 
-function ytdlpRun(args, timeoutMs = 30000) {
+function rapidApiGet(reqPath) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('yt-dlp', args);
-    let out = '', err = '';
-    const timer = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error('yt-dlp timed out')); }, timeoutMs);
-    proc.stdout.on('data', d => out += d);
-    proc.stderr.on('data', d => err += d);
-    proc.on('close', code => {
-      clearTimeout(timer);
-      if (code === 0) resolve(out);
-      else reject(new Error(err.trim().split('\n').filter(l => l.startsWith('ERROR')).pop() || err.trim().split('\n').pop() || 'yt-dlp failed'));
-    });
-  });
-}
-
-async function ytSearch(query, limit = 10) {
-  const out = await ytdlpRun([`ytsearch${limit}:${query}`, '--dump-json', '--flat-playlist', ...YTDLP_BASE]);
-  return out.trim().split('\n').filter(Boolean).map(line => {
-    const v = JSON.parse(line);
-    return {
-      title:         v.title ?? 'Unknown',
-      url:           `https://www.youtube.com/watch?v=${v.id}`,
-      durationInSec: v.duration ?? 0,
-      views:         v.view_count ?? 0,
-      channel:       { name: v.channel || v.uploader || 'Unknown' },
-      thumbnails:    [{ url: v.thumbnail || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg` }],
-    };
-  });
-}
-
-async function ytInfo(url) {
-  const out = await ytdlpRun([url, '--dump-json', ...YTDLP_BASE]);
-  const v = JSON.parse(out.trim());
-  return {
-    title:     v.title ?? 'Unknown',
-    url:       `https://www.youtube.com/watch?v=${v.id}`,
-    duration:  v.duration ?? 0,
-    author:    v.channel || v.uploader || 'Unknown',
-    thumbnail: v.thumbnail || null,
-  };
-}
-
-async function getAudioResource(url) {
-  const proc = spawn('yt-dlp', ['-f', 'bestaudio', '-o', '-', ...YTDLP_BASE, url]);
-  const ffmpeg = spawn('ffmpeg', ['-i', 'pipe:0', '-vn', '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
-  proc.stdout.pipe(ffmpeg.stdin);
-  proc.stderr.on('data', d => { const s = d.toString(); if (s.includes('ERROR')) console.error('yt-dlp:', s.trim()); });
-  return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
-}
-
-// ── Downloads via InnerTube TV-embedded client (no cookies needed) ────────────
-// TV client returns direct stream URLs without signature cipher
-async function getTvStreams(videoId) {
-  return new Promise((resolve, reject) => {
-    const body = Buffer.from(JSON.stringify({
-      videoId,
-      context: {
-        client: { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', hl: 'en', gl: 'US' },
-        thirdParty: { embedUrl: 'https://www.youtube.com' },
-      },
-    }));
     const req = https.request({
-      hostname: 'www.youtube.com',
-      path: '/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false',
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': body.length, 'User-Agent': 'Mozilla/5.0', 'X-YouTube-Client-Name': '85', 'X-YouTube-Client-Version': '2.0' },
-      timeout: 15000,
+      hostname: RAPIDAPI_HOST,
+      path: reqPath,
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-rapidapi-host': RAPIDAPI_HOST,
+        'x-rapidapi-key': RAPIDAPI_KEY,
+      },
+      timeout: 20000,
     }, res => {
       let out = '';
       res.on('data', d => out += d);
       res.on('end', () => {
-        try {
-          const data = JSON.parse(out);
-          if (data?.playabilityStatus?.status !== 'OK') reject(new Error(data?.playabilityStatus?.reason ?? 'Video unavailable'));
-          else resolve(data);
-        } catch { reject(new Error('Bad player response')); }
+        try { resolve(JSON.parse(out)); }
+        catch { reject(new Error('Bad response from downloader API: ' + out.slice(0, 150))); }
       });
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Player request timed out')); });
-    req.write(body);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Downloader API timed out')); });
     req.end();
   });
+}
+
+// Recursively search a parsed JSON object for the first value whose key matches keyPattern
+function deepFind(obj, keyPattern, typeCheck = () => true) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const [k, v] of Object.entries(obj)) {
+    if (keyPattern.test(k) && typeCheck(v)) return v;
+  }
+  for (const v of Object.values(obj)) {
+    if (v && typeof v === 'object') {
+      const found = deepFind(v, keyPattern, typeCheck);
+      if (found !== null) return found;
+    }
+  }
+  return null;
+}
+
+function extractDownloadUrl(data) {
+  return deepFind(data, /url|link/i, v => typeof v === 'string' && v.startsWith('http'));
+}
+function extractTitle(data) {
+  return deepFind(data, /title/i, v => typeof v === 'string' && v.length > 0) ?? 'Unknown';
+}
+function extractDuration(data) {
+  return deepFind(data, /duration|length/i, v => typeof v === 'number') ?? 0;
+}
+
+async function ytInfo(url) {
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const data = await rapidApiGet(`/download_audio/${videoId}?quality=251`);
+  return {
+    title:    extractTitle(data),
+    url:      `https://www.youtube.com/watch?v=${videoId}`,
+    duration: extractDuration(data),
+    author:   deepFind(data, /author|channel|uploader/i, v => typeof v === 'string') ?? 'Unknown',
+    thumbnail: deepFind(data, /thumbnail/i, v => typeof v === 'string' && v.startsWith('http')),
+  };
+}
+
+async function downloadMp4(url, outputPath) {
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const data = await rapidApiGet(`/download_video/${videoId}?quality=18`); // itag 18 = 360p mp4, muxed video+audio
+  const dlUrl = extractDownloadUrl(data);
+  if (!dlUrl) {
+    console.error('[rapidapi] video response:', JSON.stringify(data).slice(0, 400));
+    throw new Error('Downloader API did not return a video link');
+  }
+  await streamToFile(dlUrl, outputPath);
+}
+
+async function downloadMp3(url, outputPath) {
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const data = await rapidApiGet(`/download_audio/${videoId}?quality=251`); // itag 251 = opus audio
+  const dlUrl = extractDownloadUrl(data);
+  if (!dlUrl) {
+    console.error('[rapidapi] audio response:', JSON.stringify(data).slice(0, 400));
+    throw new Error('Downloader API did not return an audio link');
+  }
+  const tmp = outputPath + '_tmp';
+  try {
+    await streamToFile(dlUrl, tmp);
+    await execAsync(`ffmpeg -i "${tmp}" -vn -ar 44100 -ac 2 -b:a 192k "${outputPath}" -y`);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+async function getAudioResource(url) {
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL');
+  const data = await rapidApiGet(`/download_audio/${videoId}?quality=251`);
+  const dlUrl = extractDownloadUrl(data);
+  if (!dlUrl) throw new Error('Downloader API did not return an audio link');
+  const ffmpeg = spawn('ffmpeg', [
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-i', dlUrl, '-vn', '-ar', '48000', '-ac', '2', '-f', 's16le', 'pipe:1',
+  ], { stdio: ['ignore', 'pipe', 'ignore'] });
+  return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
 }
 
 function streamToFile(url, dest) {
@@ -182,50 +162,38 @@ function streamToFile(url, dest) {
   });
 }
 
-async function downloadMp4(url, outputPath) {
-  const videoId = extractVideoId(url);
-  if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await getTvStreams(videoId);
-  const formats = data.streamingData?.adaptiveFormats ?? [];
-  const combined = data.streamingData?.formats ?? [];
+// ── yt-dlp (search only — RapidAPI has no search endpoint) ────────────────────
+const YTDLP_BASE = ['--no-playlist', '--extractor-args', 'youtube:player_client=android', '--no-warnings', '--quiet'];
 
-  const videoStream = formats
-    .filter(f => f.mimeType?.startsWith('video/mp4') && f.url && (f.height ?? 999) <= 720)
-    .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))[0];
-  const audioStream = formats
-    .filter(f => f.mimeType?.startsWith('audio/') && f.url)
-    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
-
-  if (videoStream?.url && audioStream?.url) {
-    const tmpV = outputPath + '_v.mp4', tmpA = outputPath + '_a.m4a';
-    try {
-      await streamToFile(videoStream.url, tmpV);
-      await streamToFile(audioStream.url, tmpA);
-      await execAsync(`ffmpeg -i "${tmpV}" -i "${tmpA}" -c copy "${outputPath}" -y`);
-    } finally { [tmpV, tmpA].forEach(f => { try { fs.unlinkSync(f); } catch {} }); }
-    return;
-  }
-  const fallback = combined.find(f => f.mimeType?.startsWith('video/mp4') && f.url);
-  if (!fallback) throw new Error('No video stream found. Try .play to stream instead.');
-  await streamToFile(fallback.url, outputPath);
+function ytdlpRun(args, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('yt-dlp', args);
+    let out = '', err = '';
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error('Search timed out')); }, timeoutMs);
+    proc.stdout.on('data', d => out += d);
+    proc.stderr.on('data', d => err += d);
+    proc.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0) return resolve(out);
+      reject(new Error('Search failed — try .dl with a direct YouTube link instead'));
+    });
+  });
 }
 
-async function downloadMp3(url, outputPath) {
-  const videoId = extractVideoId(url);
-  if (!videoId) throw new Error('Invalid YouTube URL');
-  const data = await getTvStreams(videoId);
-  const audioUrl = (data.streamingData?.adaptiveFormats ?? [])
-    .filter(f => f.mimeType?.startsWith('audio/') && f.url)
-    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0]?.url
-    ?? (data.streamingData?.formats ?? []).find(f => f.url)?.url;
-  if (!audioUrl) throw new Error('No audio stream found');
-  const tmp = outputPath + '_tmp';
-  try {
-    await streamToFile(audioUrl, tmp);
-    await execAsync(`ffmpeg -i "${tmp}" -vn -ar 44100 -ac 2 -b:a 192k "${outputPath}" -y`);
-  } finally { try { fs.unlinkSync(tmp); } catch {} }
+async function ytSearch(query, limit = 10) {
+  const out = await ytdlpRun([`ytsearch${limit}:${query}`, '--dump-json', '--flat-playlist', ...YTDLP_BASE]);
+  return out.trim().split('\n').filter(Boolean).map(line => {
+    const v = JSON.parse(line);
+    return {
+      title:         v.title ?? 'Unknown',
+      url:           `https://www.youtube.com/watch?v=${v.id}`,
+      durationInSec: v.duration ?? 0,
+      views:         v.view_count ?? 0,
+      channel:       { name: v.channel || v.uploader || 'Unknown' },
+      thumbnails:    [{ url: v.thumbnail || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg` }],
+    };
+  });
 }
-
 
 // ── Guild state ───────────────────────────────────────────────────────────────
 function getGuild(guildId) {
