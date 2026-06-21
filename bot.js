@@ -175,61 +175,62 @@ async function tiktokGetDownloadUrl(videoUrl) {
   try {
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
-    await page.goto('https://snaptik.app/en', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto('https://downr.org/', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     const inputSelector = await page.evaluate(() => {
-      const candidates = ['#url', 'input[name="url"]', 'input[type="text"]'];
+      const candidates = ['#url', 'input[name="url"]', 'input[type="text"]', 'input[type="url"]'];
       for (const sel of candidates) { if (document.querySelector(sel)) return sel; }
       return null;
     });
-    if (!inputSelector) throw new Error('Could not find the URL input field on snaptik.app');
+    if (!inputSelector) {
+      const html = await page.content();
+      console.error('[tiktok] no input field found, page html snippet:', html.slice(0, 1000));
+      throw new Error('Could not find the URL input field on downr.org');
+    }
 
     await page.click(inputSelector, { clickCount: 3 }).catch(() => {});
     await page.type(inputSelector, videoUrl, { delay: 10 });
 
     try {
       await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-        const btn = btns.find(b => /download/i.test(b.textContent || b.value || ''));
+        const els = Array.from(document.querySelectorAll('button, input[type="submit"], a'));
+        const btn = els.find(b => /download|search|go|submit/i.test(b.textContent || b.value || ''));
         if (btn) btn.click();
       });
     } catch (e) {
       if (!/context was destroyed|navigation/i.test(e.message)) throw e;
     }
 
-    // snaptik.app loads results via AJAX (no full page navigation expected),
-    // so wait for a result link to show up in the DOM.
-    await page.waitForFunction(() => {
-      return Array.from(document.querySelectorAll('a')).some(a =>
-        a.href?.startsWith('http') && (/\.mp4(\?|$)/i.test(a.href) || /download/i.test(a.textContent))
-      );
-    }, { timeout: 30000 }).catch(() => {});
+    // Give the page time to process via AJAX, or settle after navigation.
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 6000 }).catch(() => {});
+    await new Promise(r => setTimeout(r, 4000));
 
     const candidates = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll('a'))
-        .map(a => ({
-          href: a.href,
-          text: (a.textContent || '').trim(),
-          cls: a.className || '',
-        }))
-        .filter(a => a.href && a.href.startsWith('http'));
+      const fromAnchors = Array.from(document.querySelectorAll('a')).map(a => ({
+        tag: 'a', href: a.href, text: (a.textContent || '').trim(), cls: a.className || '',
+      }));
+      const fromVideos = Array.from(document.querySelectorAll('video, video source')).map(v => ({
+        tag: 'video', href: v.src || v.currentSrc || '', text: '', cls: v.className || '',
+      }));
+      return [...fromAnchors, ...fromVideos].filter(a => a.href && a.href.startsWith('http'));
     });
-    console.log('[tiktok] candidate links:', JSON.stringify(candidates).slice(0, 1500));
+    console.log('[tiktok] candidate links:', JSON.stringify(candidates).slice(0, 2000));
 
-    const isJunk = l => /thumb|cover|preview|poster|avatar|icon|logo/i.test(l.href) || /thumb|cover|preview|poster/i.test(l.text);
+    const isJunk = l => /thumb|cover|preview|poster|avatar|icon|logo|favicon/i.test(l.href) || /thumb|cover|preview|poster/i.test(l.text);
 
     let dlUrl =
       candidates.find(l => !isJunk(l) && /without watermark|no watermark/i.test(l.text))?.href ??
       candidates.find(l => !isJunk(l) && /download/i.test(l.text) && /hd|high quality/i.test(l.text))?.href ??
       candidates.find(l => !isJunk(l) && /download/i.test(l.text) && /\.mp4(\?|$)/i.test(l.href))?.href ??
+      candidates.find(l => !isJunk(l) && l.tag === 'video')?.href ??
       candidates.find(l => !isJunk(l) && /download/i.test(l.text))?.href ??
       candidates.find(l => !isJunk(l) && /\.mp4(\?|$)/i.test(l.href))?.href ??
       null;
 
     if (!dlUrl) {
       const debugText = await page.evaluate(() => document.body.innerText).catch(() => '');
-      console.error('[tiktok] no download link found, page text:', debugText.slice(0, 500));
-      throw new Error('Could not find a download link on snaptik.app');
+      console.error('[tiktok] no download link found, page text:', debugText.slice(0, 800));
+      throw new Error('Could not find a download link on downr.org');
     }
     console.log('[tiktok] selected link:', dlUrl.slice(0, 200));
     return dlUrl;
