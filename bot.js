@@ -206,26 +206,72 @@ async function tiktokGetDownloadUrl(videoUrl) {
     await new Promise(r => setTimeout(r, 4000));
 
     const candidates = await page.evaluate(() => {
-      const fromAnchors = Array.from(document.querySelectorAll('a')).map(a => ({
-        tag: 'a', href: a.href, text: (a.textContent || '').trim(), cls: a.className || '',
-      }));
-      const fromVideos = Array.from(document.querySelectorAll('video, video source')).map(v => ({
-        tag: 'video', href: v.src || v.currentSrc || '', text: '', cls: v.className || '',
-      }));
-      return [...fromAnchors, ...fromVideos].filter(a => a.href && a.href.startsWith('http'));
+      const out = [];
+      document.querySelectorAll('a[href]').forEach(a => {
+        if (a.href?.startsWith('http')) out.push({ tag: 'a', href: a.href, text: (a.textContent || '').trim() });
+      });
+      document.querySelectorAll('video, source').forEach(v => {
+        const src = v.src || v.currentSrc;
+        if (src?.startsWith('http')) out.push({ tag: 'media', href: src, text: '' });
+      });
+      document.querySelectorAll('[data-href], [data-url], [data-src], [data-link]').forEach(el => {
+        const href = el.getAttribute('data-href') || el.getAttribute('data-url') || el.getAttribute('data-src') || el.getAttribute('data-link');
+        if (href?.startsWith('http')) out.push({ tag: el.tagName.toLowerCase() + '[data]', href, text: (el.textContent || '').trim() });
+      });
+      document.querySelectorAll('[onclick]').forEach(el => {
+        const m = (el.getAttribute('onclick') || '').match(/https?:\/\/[^\s'"]+/);
+        if (m) out.push({ tag: el.tagName.toLowerCase() + '[onclick]', href: m[0], text: (el.textContent || '').trim() });
+      });
+      return out;
     });
-    console.log('[tiktok] candidate links:', JSON.stringify(candidates).slice(0, 2000));
+    console.log('[tiktok] candidate links:', JSON.stringify(candidates).slice(0, 2500));
 
-    const isJunk = l => /thumb|cover|preview|poster|avatar|icon|logo|favicon/i.test(l.href) || /thumb|cover|preview|poster/i.test(l.text);
+    const EXCLUDE = /extension|chrome\.google|addons\.mozilla|thumb|cover|preview|poster|avatar|icon|logo|favicon/i;
+    const norm = s => s.toLowerCase().replace(/\s+/g, '');
+    const clean = candidates.filter(c => !EXCLUDE.test(c.href) && !EXCLUDE.test(c.text));
 
-    let dlUrl =
-      candidates.find(l => !isJunk(l) && /without watermark|no watermark/i.test(l.text))?.href ??
-      candidates.find(l => !isJunk(l) && /download/i.test(l.text) && /hd|high quality/i.test(l.text))?.href ??
-      candidates.find(l => !isJunk(l) && /download/i.test(l.text) && /\.mp4(\?|$)/i.test(l.href))?.href ??
-      candidates.find(l => !isJunk(l) && l.tag === 'video')?.href ??
-      candidates.find(l => !isJunk(l) && /download/i.test(l.text))?.href ??
-      candidates.find(l => !isJunk(l) && /\.mp4(\?|$)/i.test(l.href))?.href ??
-      null;
+    // downr.org labels its quality options exactly like this — match by exact label first.
+    const priorityLabels = ['hd_no_watermark', 'no_watermark', '1080p', '720p', '480p', 'watermark'];
+    let dlUrl = null;
+    for (const label of priorityLabels) {
+      const found = clean.find(c => norm(c.text) === label);
+      if (found) { dlUrl = found.href; break; }
+    }
+    if (!dlUrl) dlUrl = clean.find(c => c.tag === 'media')?.href ?? null;
+    if (!dlUrl) dlUrl = clean.find(c => /download/i.test(c.text))?.href ?? null;
+    if (!dlUrl) dlUrl = clean.find(c => /\.mp4(\?|$)/i.test(c.href))?.href ?? null;
+
+    // Last resort: these might be JS-bound buttons, not plain links. Click the
+    // matching label and capture whatever video file request it triggers.
+    if (!dlUrl) {
+      for (const label of priorityLabels) {
+        const responsePromise = new Promise(resolve => {
+          const handler = res => {
+            const url = res.url();
+            const ct = res.headers()['content-type'] || '';
+            if (/\.mp4(\?|$)/i.test(url) || ct.startsWith('video/')) {
+              page.off('response', handler);
+              resolve(url);
+            }
+          };
+          page.on('response', handler);
+          setTimeout(() => { page.off('response', handler); resolve(null); }, 12000);
+        });
+
+        const clickedLabel = await page.evaluate((lbl) => {
+          const norm = s => s.toLowerCase().replace(/\s+/g, '');
+          const all = Array.from(document.querySelectorAll('a, button, div, span, li'));
+          const el = all.find(e => norm(e.textContent || '') === lbl && e.children.length === 0);
+          if (el) { el.click(); return true; }
+          return false;
+        }, label).catch(() => false);
+
+        if (clickedLabel) {
+          const captured = await responsePromise;
+          if (captured) { dlUrl = captured; console.log('[tiktok] captured via network response:', captured.slice(0, 200)); break; }
+        }
+      }
+    }
 
     if (!dlUrl) {
       const debugText = await page.evaluate(() => document.body.innerText).catch(() => '');
